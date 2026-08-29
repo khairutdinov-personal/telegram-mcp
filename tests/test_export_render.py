@@ -10,6 +10,7 @@ above it cannot quietly become decorative.
 
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -210,3 +211,125 @@ def test_html_paginates(export_dir):
     assert (path / "messages.html").exists()
     assert (path / "messages2.html").exists()
     assert 'href="messages2.html"' in (path / "messages.html").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Rich messages in an export
+# ---------------------------------------------------------------------------
+#
+# Found live on 2026-08-29: the first message of a real export was a rich
+# message and went to disk as an empty line, because the content lives in page
+# blocks and `message` is empty.
+
+
+def _rich_message(text):
+    from telethon.tl import types
+
+    return types.RichMessage(
+        blocks=[types.PageBlockParagraph(text=types.TextPlain(text=text))],
+        photos=[],
+        documents=[],
+    )
+
+
+def test_rich_message_reaches_the_export_record():
+    from telegram_mcp import rich_messages
+
+    record = {"text": ""}
+    rich_messages.attach_to_record(
+        record, SimpleNamespace(rich_message=_rich_message("Quarterly plan"))
+    )
+
+    assert record["text"] == "Quarterly plan"
+    assert record["rich_message"] == {}
+
+
+def test_export_keeps_plain_text_when_a_message_has_both():
+    from telegram_mcp import rich_messages
+
+    record = {"text": "caption"}
+    rich_messages.attach_to_record(record, SimpleNamespace(rich_message=_rich_message("blocks")))
+
+    assert record["text"] == "caption"
+    assert record["rich_message"]["markdown"] == "blocks"
+
+
+def test_export_record_without_rich_content_is_untouched():
+    from telegram_mcp import rich_messages
+
+    record = {"text": "plain"}
+    rich_messages.attach_to_record(record, SimpleNamespace(rich_message=None))
+
+    assert record == {"text": "plain"}
+
+
+def test_export_does_not_sanitize_the_rendering():
+    """The MCP tools sanitize user content; a JSONL export is a faithful copy."""
+    from telegram_mcp import rich_messages
+
+    verbatim = {"text": ""}
+    sanitized = {"text": ""}
+    msg = SimpleNamespace(rich_message=_rich_message("a <b>tag</b>"))
+
+    rich_messages.attach_to_record(verbatim, msg)
+    rich_messages.attach_to_record(sanitized, msg, transform=lambda value: value.upper())
+
+    assert verbatim["text"] == "a <b>tag</b>"
+    assert sanitized["text"] == "A <B>TAG</B>"
+
+
+@pytest.mark.asyncio
+async def test_iter_records_writes_rich_content_not_an_empty_line():
+    """The end-to-end guard: the renderer being correct is not enough if the
+    export never calls it. This is the shape that reached disk empty."""
+    import datetime as dt
+
+    from telethon.tl import types
+
+    from telegram_mcp.export import fetch
+
+    class _Iterator:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._items:
+                raise StopAsyncIteration
+            return self._items.pop(0)
+
+    class _Client:
+        def __init__(self, items):
+            self._items = items
+
+        def iter_messages(self, entity, **kwargs):
+            return _Iterator(self._items)
+
+    rich_only = SimpleNamespace(
+        id=860243,
+        date=dt.datetime(2026, 8, 26, tzinfo=dt.timezone.utc),
+        message="",
+        entities=None,
+        out=True,
+        sender=None,
+        sender_id=42,
+        rich_message=_rich_message("# Plan\n\nline"),
+        media=None,
+    )
+
+    records = [
+        record
+        async for record in fetch.iter_records(
+            _Client([rich_only]),
+            types.PeerUser(user_id=42),
+            since=None,
+            until=None,
+            include_raw=False,
+        )
+    ]
+
+    assert len(records) == 1
+    assert "Plan" in records[0]["text"]
+    assert records[0]["rich_message"] == {}

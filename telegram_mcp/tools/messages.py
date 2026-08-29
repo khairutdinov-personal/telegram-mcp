@@ -151,15 +151,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None) -> dict:
     # A rich message keeps its content in page blocks, not in msg.message: without
     # this the whole message reads as empty. The rendered Markdown goes where a
     # reader looks for content, and is not repeated inside rich_message.
-    rich_payload = rich_messages.message_rich_payload(msg)
-    if rich_payload is not None:
-        markdown = rich_payload.pop("markdown", "")
-        if markdown:
-            if text:
-                rich_payload["markdown"] = markdown
-            else:
-                d["text"] = sanitize_user_content(markdown)
-        d["rich_message"] = rich_payload
+    rich_messages.attach_to_record(d, msg, transform=sanitize_user_content)
 
     if not text:
         voice_info = transcription.voice_attachment_info(msg, chat_id)

@@ -12,6 +12,8 @@ from telethon.tl.types import (
     User,
 )
 
+from telegram_mcp import rich_messages
+
 from . import media as media_mod
 from .entities import entities_to_json
 from .util import ExportError, log
@@ -198,7 +200,9 @@ async def iter_records(
 
     from telegram_mcp import transcription
 
-    cache_chat_id = tl_utils.get_peer_id(entity)
+    # Only needed to key the transcript cache; an export without
+    # transcription should not depend on the entity shape at all.
+    cache_chat_id = tl_utils.get_peer_id(entity) if transcribe_engine else None
 
     iterator = client.iter_messages(entity, reverse=True, min_id=floor)
     while True:
@@ -242,6 +246,9 @@ async def iter_records(
             "media": None,
             "transcript": None,
         }
+        # A rich message keeps its content in page blocks, so `message` is
+        # empty and the export would write a blank line where a document was.
+        rich_messages.attach_to_record(record, message)
 
         kind = media_mod.classify(message)
         if kind:
