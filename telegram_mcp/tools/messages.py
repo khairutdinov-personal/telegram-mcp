@@ -2814,9 +2814,9 @@ async def get_pinned_messages(chat_id: Union[int, str], account: Optional[str] =
                 "id": msg.id,
                 "sender": get_sender_info(msg),
                 "date": msg.date,
-                "text": sanitize_user_content(msg.message),
                 **get_custom_emoji_metadata(msg),
             }
+            attach_message_text(record, msg)
             forum = bool(getattr(entity, "forum", False))
             topic_id = message_topic_id(msg, forum)
             if topic_id:

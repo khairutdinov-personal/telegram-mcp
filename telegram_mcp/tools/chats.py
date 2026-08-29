@@ -906,11 +906,12 @@ async def get_chat(chat_id: Union[int, str], account: Optional[str] = None) -> s
                 if sender:
                     sender_name = person_name(sender) or getattr(sender, "title", "Unknown")
                 sender_name = sanitize_name(sender_name.strip() or "Unknown")
-                record["last_message"] = {
+                last_message = {
                     "sender": sender_name,
                     "date": last_msg.date,
-                    "text": sanitize_user_content(last_msg.message),
                 }
+                attach_message_text(last_message, last_msg)
+                record["last_message"] = last_message
         except Exception:
             logger.warning("Could not get requested dialog metadata")
 
