@@ -54,12 +54,13 @@ whisper = [
 
 [tool.setuptools]
 py-modules = ["main", "migrate_session", "sanitize", "session_string_generator"]
-packages = ["telegram_mcp", "telegram_mcp.tools", "telegram_mcp.transport"]
+packages = ["telegram_mcp", "telegram_mcp.tools", "telegram_mcp.transport", "telegram_mcp.export"]
 
 [project.scripts]
 telegram-mcp = "main:main"
 telegram-mcp-generate-session = "session_string_generator:main"
 telegram-mcp-migrate-session = "migrate_session:main"
+telegram-mcp-export = "telegram_mcp.export.cli:main"
 
 [tool.black]
 line-length = 99
