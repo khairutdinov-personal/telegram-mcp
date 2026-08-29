@@ -29,6 +29,15 @@ def json_default(obj: Any) -> Any:
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+class ExportError(Exception):
+    """A bad target, date or format - the caller's fault, not a crash.
+
+    Not SystemExit: the same code runs inside the MCP server, where killing the
+    interpreter over an unresolvable chat name would take the whole server with
+    it. The CLI turns this back into an exit code at its own boundary.
+    """
+
+
 def safe_name(value: str, limit: int = 60) -> str:
     """Filesystem-safe, human-readable slug. Keeps Cyrillic and spaces."""
     value = unicodedata.normalize("NFC", value or "")
@@ -45,7 +54,7 @@ def parse_date(value: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(raw)
     except ValueError:
-        raise SystemExit(f"Cannot parse date '{value}'. Use YYYY-MM-DD or an ISO timestamp.")
+        raise ExportError(f"Cannot parse date '{value}'. Use YYYY-MM-DD or an ISO timestamp.")
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed

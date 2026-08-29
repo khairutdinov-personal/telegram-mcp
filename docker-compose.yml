@@ -15,6 +15,7 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_HOST: 0.0.0.0
+      TELEGRAM_EXPORT_DIR: /app/data/exports
     # The endpoint is unauthenticated — publish on localhost only.
     ports:
       - "127.0.0.1:8765:8765"
@@ -32,4 +33,10 @@ services:
       # Host directory must be readable/writable by uid 1000 (appuser):
       #   mkdir -p ./transcript_cache && chown 1000:1000 ./transcript_cache
       - ./transcript_cache:/app/data/transcripts
+      # Chat exports (start_chat_export). Hundreds of megabytes per run and the
+      # whole point is that they outlive the container, so this must be a bind
+      # mount, not the writable layer. Host directory must be readable/writable
+      # by uid 1000 (appuser):
+      #   mkdir -p ./exports && chown 1000:1000 ./exports
+      - ./exports:/app/data/exports
     restart: unless-stopped

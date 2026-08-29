@@ -526,14 +526,55 @@ From an MCP client configuration, pass the same roots after `main.py`:
 
 ## Bulk Chat Export
 
-Exporting a dozen chats is a CLI job, not an MCP tool: the output belongs on
-disk, not in a client's context window. `telegram-mcp-export` ships with this
-package and shares its plumbing - client construction, device identity, proxy
-support and voice transcription.
+One export engine, two ways to drive it. **JSONL is the source of truth; HTML,
+Markdown and plain text are rendered from it**, so changing your mind about the
+format costs nothing and never touches the Telegram API again.
 
-**JSONL is the source of truth; HTML, Markdown and plain text are rendered from
-it**, so changing your mind about the format costs nothing and never touches the
-Telegram API again.
+| | `start_chat_export` (MCP tools) | `telegram-mcp-export` (CLI) |
+|---|---|---|
+| Session | the server's, already logged in | its own, one interactive login |
+| Files land | next to the server | on the machine you ran it from |
+| Runs for hours | yes, as a background job | yes, in your terminal |
+
+Neither streams the export through a client's context window: the tools return
+a job id and counters, and the bytes go to disk either way.
+
+### Through the server (no second login)
+
+`start_chat_export` starts a background job on the account the server is already
+running as, so there is no second session, no second device and no second code
+by SMS.
+
+```
+start_chat_export(chats=["@team", "Some Group"], months=6, formats="jsonl,html", media=True)
+  -> {"started": true, "job_id": "9f2c1a7b40de", "out": "/app/data/exports", ...}
+
+export_status(job_id="9f2c1a7b40de")
+  -> {"state": "running", "current": {"index": 2, "of": 2, ...}, "done": [...], "failed": [...]}
+```
+
+Depth is required and must be stated exactly once: `everything=True`, `months=N`
+or `since="YYYY-MM-DD"`. An export with no depth would quietly mean something
+different for every chat.
+
+`export_status()` with no id lists recent jobs and names the export root.
+`cancel_export(job_id)` stops one; whatever it wrote stays on disk, and
+`resume=True` picks up from there. A job whose record outlived its process (the
+server restarted mid-export) reports `interrupted` rather than pretending to
+still be running.
+
+Output goes to `TELEGRAM_EXPORT_DIR` (default `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/exports`).
+In Docker that is a bind mount - see [Docker](#docker) - because the whole point
+is that the files outlive the container. **These tools write to the server's
+disk, so they are not annotated `readOnlyHint`**: a read-only deployment that
+wants them has to say so explicitly, e.g.
+`TELEGRAM_EXPOSED_TOOLS=read-only+start_chat_export,export_status,cancel_export`.
+
+### From the command line
+
+`telegram-mcp-export` ships with this package and shares the same plumbing -
+client construction, device identity, proxy support and voice transcription. Use
+it when the files should land on your own machine rather than on the server's.
 
 ### Session
 

@@ -8,10 +8,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .fetch import chat_meta, display_name, iter_records, resolve_target
-from .render import read_records, render
+from .fetch import display_name
+from .render import render
+from .run import ExportOptions, export_one
 from .session import build_client, connected, ensure_authorised, session_path
-from .util import json_default, log, months_ago, parse_date, safe_name
+from .util import ExportError, log, months_ago, parse_date
 
 try:  # the console script is installed from this package
     from importlib.metadata import version as _dist_version
@@ -220,104 +221,6 @@ async def cmd_chats(args) -> int:
     return 0
 
 
-def _resume_floor(export_dir: Path) -> int:
-    source = export_dir / "messages.jsonl"
-    if not source.exists():
-        return 0
-    last = 0
-    for record in read_records(source):
-        last = max(last, int(record.get("id") or 0))
-    return last
-
-
-async def export_one(
-    client, target: str, args, formats: list[str], since, until
-) -> Optional[dict]:
-    entity = await resolve_target(client, target)
-    meta = await chat_meta(client, entity)
-    folder = f"{safe_name(meta['title'] or 'chat')}_{meta['id']}"
-    export_dir = Path(args.out).expanduser() / folder
-    export_dir.mkdir(parents=True, exist_ok=True)
-
-    min_id = _resume_floor(export_dir) if args.resume else 0
-    mode = "a" if (args.resume and min_id) else "w"
-    if mode == "w" and (export_dir / "messages.jsonl").exists():
-        (export_dir / "messages.jsonl").unlink()
-
-    log(
-        f"→ {meta['title']} ({meta['type']}, id {meta['id']})"
-        + (f" · resuming after message {min_id}" if min_id else "")
-    )
-
-    media_root = export_dir / "media" if args.media else None
-    if media_root:
-        media_root.mkdir(parents=True, exist_ok=True)
-    media_max = int(args.media_max_mb * 1024 * 1024) if args.media_max_mb else None
-
-    people: dict[int, str] = {}
-    count = 0
-    first_date = last_date = None
-    jsonl_path = export_dir / "messages.jsonl"
-
-    with jsonl_path.open(mode, encoding="utf-8") as handle:
-        async for record in iter_records(
-            client,
-            entity,
-            since=since,
-            until=until,
-            min_id=min_id,
-            media_root=media_root,
-            media_max_bytes=media_max,
-            transcribe_engine=args.transcribe,
-            include_raw=not args.no_raw,
-            people=people,
-        ):
-            handle.write(json.dumps(record, default=json_default, ensure_ascii=False) + "\n")
-            count += 1
-            stamp = record.get("date")
-            if stamp is not None:
-                stamp = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp)
-                first_date = first_date or stamp
-                last_date = stamp
-
-    # On a resume the window has to describe the whole file, not just the tail.
-    total = count
-    if mode == "a":
-        total = sum(1 for _ in read_records(jsonl_path))
-        rows = list(read_records(jsonl_path))
-        first_date = rows[0].get("date") if rows else first_date
-        last_date = rows[-1].get("date") if rows else last_date
-
-    meta_payload = {
-        "tool": f"telegram-mcp-export {__version__}",
-        "exported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "chat": meta,
-        "message_count": total,
-        "added_this_run": count,
-        "window": {
-            "requested_since": since.isoformat() if since else None,
-            "requested_until": until.isoformat() if until else None,
-            "first": first_date,
-            "last": last_date,
-        },
-        "options": {
-            "media": bool(args.media),
-            "media_max_mb": args.media_max_mb or None,
-            "transcribe": args.transcribe,
-            "raw_included": not args.no_raw,
-            "formats": formats,
-        },
-        "people": {str(k): v for k, v in sorted(people.items())},
-    }
-    (export_dir / "meta.json").write_text(
-        json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    log(f"  jsonl: {count} new message(s), {total} total → {jsonl_path}")
-    render(export_dir, meta_payload, formats)
-    return {"dir": export_dir, "meta": meta_payload}
-
-
 async def cmd_export(args) -> int:
     targets = collect_targets(args)
     if args.transcribe:
@@ -341,6 +244,18 @@ async def cmd_export(args) -> int:
                 "would be silent, so set the key or pass --transcribe=telegram."
             )
 
+    options = ExportOptions(
+        out=Path(args.out).expanduser(),
+        formats=formats,
+        since=since,
+        until=until,
+        media=bool(args.media),
+        media_max_mb=args.media_max_mb or None,
+        transcribe=args.transcribe,
+        include_raw=not args.no_raw,
+        resume=bool(args.resume),
+    )
+
     client = build_client(args.session)
     results, failures = [], []
     async with connected(client):
@@ -348,10 +263,10 @@ async def cmd_export(args) -> int:
         for index, target in enumerate(targets, start=1):
             log(f"[{index}/{len(targets)}] {target}")
             try:
-                result = await export_one(client, target, args, formats, since, until)
+                result = await export_one(client, target, options)
                 if result:
                     results.append(result)
-            except SystemExit as exc:
+            except (SystemExit, ExportError) as exc:
                 failures.append((target, str(exc)))
                 log(f"  ! skipped: {exc}")
             except Exception as exc:
@@ -391,6 +306,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     handler = COMMANDS[args.command]
     try:
         return asyncio.run(handler(args))
+    except ExportError as exc:
+        log(f"Error: {exc}")
+        return 1
     except KeyboardInterrupt:
         log("Interrupted. Whatever was written stays on disk; re-run with --resume.")
         return 130
