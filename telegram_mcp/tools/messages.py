@@ -1052,8 +1052,8 @@ async def list_messages(
                 "id": msg.id,
                 "sender": get_sender_info(msg),
                 "date": msg.date,
-                "text": sanitize_user_content(msg.message),
             }
+            attach_message_text(record, msg)
             # Upstream bug: this hand-built record never called get_media_label,
             # so a voice/photo/etc. with no caption was indistinguishable from
             # an actually-empty message. message_to_dict (used by get_history)
@@ -1276,8 +1276,8 @@ async def get_message_context(
                 "sender": sender_name,
                 "date": msg.date,
                 "is_target": msg.id == message_id,
-                "text": sanitize_user_content(msg.message),
             }
+            attach_message_text(record, msg)
             if getattr(msg, "sender_id", None):
                 record["sender_id"] = msg.sender_id
             _username = get_sender_username(msg)
@@ -1298,8 +1298,8 @@ async def get_message_context(
                     if replied_msg:
                         replied_record = {
                             "sender": get_sender_name(replied_msg),
-                            "text": sanitize_user_content(replied_msg.message),
                         }
+                        attach_message_text(replied_record, replied_msg)
                         if getattr(replied_msg, "sender_id", None):
                             replied_record["sender_id"] = replied_msg.sender_id
                         _r_username = get_sender_username(replied_msg)
@@ -1775,8 +1775,8 @@ async def search_messages(
                 "id": msg.id,
                 "sender": get_sender_info(msg),
                 "date": msg.date,
-                "text": sanitize_user_content(msg.message),
             }
+            attach_message_text(record, msg)
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 record["reply_to"] = msg.reply_to.reply_to_msg_id
             reply_quote = get_reply_quote(msg)
@@ -1821,16 +1821,15 @@ async def search_global(
             chat_name = (
                 getattr(chat, "title", None) or getattr(chat, "first_name", "") or str(msg.chat_id)
             )
-            records.append(
-                {
-                    "chat_name": sanitize_name(chat_name),
-                    "chat_id": msg.chat_id,
-                    "id": msg.id,
-                    "sender": get_sender_info(msg),
-                    "date": msg.date,
-                    "text": sanitize_user_content(msg.message),
-                }
-            )
+            record = {
+                "chat_name": sanitize_name(chat_name),
+                "chat_id": msg.chat_id,
+                "id": msg.id,
+                "sender": get_sender_info(msg),
+                "date": msg.date,
+            }
+            attach_message_text(record, msg)
+            records.append(record)
 
         return format_tool_result(records)
     except Exception as e:
@@ -1896,8 +1895,8 @@ async def get_pinned_messages(chat_id: Union[int, str], account: str = None) -> 
                 "id": msg.id,
                 "sender": get_sender_info(msg),
                 "date": msg.date,
-                "text": sanitize_user_content(msg.message),
             }
+            attach_message_text(record, msg)
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 record["reply_to"] = msg.reply_to.reply_to_msg_id
             reply_quote = get_reply_quote(msg)
