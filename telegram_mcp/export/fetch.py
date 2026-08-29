@@ -81,8 +81,11 @@ async def resolve_target(client: Any, target: str) -> Any:
     if len(matches) == 1:
         return matches[0].entity
     if not matches:
+        # No CLI command in the text: the same engine answers the MCP tools,
+        # and their caller has no shell to run it in.
         raise ExportError(
-            f"No chat matches '{target}'. Run 'telegram-mcp-export chats' to see the list."
+            f"No chat matches '{target}'. Pass a @username, a t.me link, a numeric "
+            "chat id, or an exact chat title."
         )
     listing = "\n".join(f"  {d.id}\t{d.name}" for d in matches[:15])
     raise ExportError(
