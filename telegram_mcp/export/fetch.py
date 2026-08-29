@@ -14,7 +14,7 @@ from telethon.tl.types import (
 
 from . import media as media_mod
 from .entities import entities_to_json
-from .util import log
+from .util import ExportError, log
 
 
 def display_name(entity: Any) -> Optional[str]:
@@ -44,7 +44,7 @@ async def resolve_target(client: Any, target: str) -> Any:
     case-insensitive substring over the dialog list)."""
     raw = target.strip()
     if not raw:
-        raise SystemExit("Empty chat target.")
+        raise ExportError("Empty chat target.")
 
     if raw.startswith("https://t.me/") or raw.startswith("t.me/"):
         raw = "@" + raw.rsplit("/", 1)[-1]
@@ -61,7 +61,7 @@ async def resolve_target(client: Any, target: str) -> Any:
         try:
             return await client.get_entity(int(raw))
         except Exception as exc:
-            raise SystemExit(f"Cannot resolve chat id {raw}: {exc}")
+            raise ExportError(f"Cannot resolve chat id {raw}: {exc}")
 
     try:
         return await client.get_entity(raw)
@@ -79,11 +79,11 @@ async def resolve_target(client: Any, target: str) -> Any:
     if len(matches) == 1:
         return matches[0].entity
     if not matches:
-        raise SystemExit(
+        raise ExportError(
             f"No chat matches '{target}'. Run 'telegram-mcp-export chats' to see the list."
         )
     listing = "\n".join(f"  {d.id}\t{d.name}" for d in matches[:15])
-    raise SystemExit(
+    raise ExportError(
         f"'{target}' matches {len(matches)} chats - be more specific or use an id:\n{listing}"
     )
 

@@ -13,7 +13,7 @@ from string import Template
 from typing import Iterator, Optional
 
 from .entities import to_html, to_markdown
-from .util import format_duration, human_size, log
+from .util import ExportError, format_duration, human_size, log
 
 PAGE_SIZE = 3000
 
@@ -419,5 +419,5 @@ def render(export_dir: Path, meta: dict, formats: list[str]) -> None:
             continue
         renderer = RENDERERS.get(name)
         if renderer is None:
-            raise SystemExit(f"Unknown format '{name}'. Known: jsonl, html, md, txt.")
+            raise ExportError(f"Unknown format '{name}'. Known: jsonl, html, md, txt.")
         renderer(export_dir, meta)
