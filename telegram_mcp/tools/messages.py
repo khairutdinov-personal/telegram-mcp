@@ -315,23 +315,8 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
         d["out"] = True
 
     text = sanitize_user_content(msg.message) if getattr(msg, "message", None) else ""
-    # A rich message keeps its content in page blocks, not in msg.message: without
-    # this the whole message reads as empty. The rendered Markdown goes where a
-    # reader looks for content, and is not repeated inside rich_message.
-    rich_payload = rich_messages.message_rich_payload(msg)
-    markdown = rich_payload.pop("markdown", "") if rich_payload is not None else ""
-    rich = False
-    if not text:
-        # Block-format posts leave .message empty and keep the words in
-        # .rich_message; without this the whole post reads back as "[empty]".
-        rich_text = markdown or rich_message_text(msg)
-        if rich_text:
-            text = sanitize_user_content(rich_text)
-            rich = True
     if text:
         d["text"] = text
-    if rich:
-        d["rich"] = True  # text rebuilt from page blocks, not a verbatim .message
     d.update(get_custom_emoji_metadata(msg))
 
     media_label = get_media_label(msg)
@@ -352,10 +337,19 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
             "question": sanitize_user_content(poll.poll.question.text),
             "answers": [sanitize_user_content(a.text.text) for a in poll.poll.answers],
         }
-    if rich_payload is not None:
-        if markdown and text and not rich:
-            rich_payload["markdown"] = markdown
-        d["rich_message"] = rich_payload
+
+    # A rich message keeps its content in page blocks, not in msg.message: without
+    # this the whole message reads as empty. The rendered Markdown goes where a
+    # reader looks for content, and is not repeated inside rich_message.
+    rich_messages.attach_to_record(d, msg, transform=sanitize_user_content)
+    if not text:
+        if d.get("text"):
+            d["rich"] = True  # text rebuilt from page blocks, not a verbatim .message
+        elif rich_text := rich_message_text(msg):
+            # Block types the Markdown renderer left empty: the flat walk still reads them.
+            d["text"] = text = sanitize_user_content(rich_text)
+            d["rich"] = True
+        text = d.get("text", "")
 
     if not text:
         voice_info = transcription.voice_attachment_info(msg, chat_id)
