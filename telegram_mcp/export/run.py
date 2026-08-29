@@ -9,6 +9,7 @@ terminal and the other writes to a job record.
 
 import datetime as dt
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -18,6 +19,9 @@ from .render import read_records, render
 from .util import json_default, log, safe_name
 
 ProgressCallback = Callable[[dict], None]
+
+# How long a caller may see nothing at all while an export is working.
+PROGRESS_EVERY_SECONDS = 5.0
 
 
 @dataclass
@@ -106,6 +110,12 @@ async def export_one(
     people: dict = {}
     count = 0
     first_date = last_date = None
+    media_files = 0
+    media_bytes = 0
+    # A message counter alone cannot tell "downloading a 300 MB video" from
+    # "hung": with media on, a chat can spend minutes between two messages. So
+    # progress also goes out on a clock, and carries the bytes on disk.
+    last_report = time.monotonic()
 
     with jsonl_path.open(mode, encoding="utf-8") as handle:
         async for record in iter_records(
@@ -127,8 +137,24 @@ async def export_one(
                 stamp = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp)
                 first_date = first_date or stamp
                 last_date = stamp
-            if count % 200 == 0:
-                report(stage="running", chat=meta["title"], messages=count, at=last_date)
+            saved = (record.get("media") or {}).get("file")
+            if saved:
+                media_files += 1
+                try:
+                    media_bytes += (export_dir / saved).stat().st_size
+                except OSError:
+                    pass
+            now = time.monotonic()
+            if count % 200 == 0 or now - last_report >= PROGRESS_EVERY_SECONDS:
+                last_report = now
+                report(
+                    stage="running",
+                    chat=meta["title"],
+                    messages=count,
+                    at=last_date,
+                    media_files=media_files,
+                    media_bytes=media_bytes,
+                )
 
     # On a resume the window has to describe the whole file, not just the tail.
     total = count
@@ -165,5 +191,13 @@ async def export_one(
 
     log(f"  jsonl: {count} new message(s), {total} total → {jsonl_path}")
     render(export_dir, meta_payload, list(options.formats))
-    report(stage="finished", chat=meta["title"], messages=total, added=count, dir=str(export_dir))
+    report(
+        stage="finished",
+        chat=meta["title"],
+        messages=total,
+        added=count,
+        media_files=media_files,
+        media_bytes=media_bytes,
+        dir=str(export_dir),
+    )
     return {"dir": export_dir, "meta": meta_payload}
