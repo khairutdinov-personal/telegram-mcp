@@ -220,6 +220,14 @@ prefetches per listing call; `TELEGRAM_TRANSCRIPT_CACHE_DIR` (default
 `data/transcripts`) sets where the SQLite cache is written; `TELEGRAM_TRANSCRIBE_GROQ_MAX_MB`
 (default 25) is the largest recording the groq engine will upload.
 
+Telegram rate limits (`FloodWaitError`) are surfaced transparently to MCP clients and LLM agents with the exact wait duration and an explicit instruction not to retry immediately.
+
+Use `TELEGRAM_FLOOD_SLEEP_THRESHOLD` to configure Telethon's internal silent-sleep threshold (default: 60 seconds). Set to `0` to disable silent sleeping and let the agent manage all backoff pacing:
+
+```env
+TELEGRAM_FLOOD_SLEEP_THRESHOLD=60   # Max seconds Telethon sleeps silently on FloodWait (default 60)
+```
+
 Run the server locally:
 
 ```bash
@@ -854,7 +862,7 @@ Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://git
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=chigwell/telegram-mcp&type=Date)](https://www.star-history.com/#chigwell/telegram-mcp&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=chigwell/telegram-mcp&type=Date)](https://star-history.dera.page/#chigwell/telegram-mcp&Date)
 
 ## Contributors
 

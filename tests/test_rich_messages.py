@@ -117,3 +117,86 @@ async def test_edit_rich_both_premium_cases():
     result = json.loads(await messages._edit_rich(no, "peer", 7, "new", "rich"))
     assert result["reason"] == "telegram_premium_required"
     assert no.requests == []
+
+
+# --- reading rich messages -------------------------------------------------
+# A channel posting in the block format leaves msg.message empty and puts every
+# word into msg.rich_message, so such a post used to read back as "[empty]".
+
+types = runtime.types
+
+
+def _msg(**overrides):
+    base = dict(
+        id=224,
+        sender=None,
+        sender_id=42,
+        date="2026-09-03",
+        message="",
+        reply_to=None,
+        rich_message=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _plain(text):
+    return types.TextPlain(text=text)
+
+
+def _rich(*blocks):
+    return types.RichMessage(blocks=list(blocks), photos=[], documents=[])
+
+
+def _post_like_agents_lab_224():
+    """The shape a real block-format post arrives in: a heading carrying a
+    custom emoji, an uncaptioned photo, then paragraphs."""
+    return _rich(
+        types.PageBlockHeading1(
+            text=types.TextConcat(
+                texts=[
+                    _plain("Личная CRM "),
+                    types.TextCustomEmoji(document_id=5927026418616636353, alt="🧠"),
+                ]
+            )
+        ),
+        types.PageBlockPhoto(
+            photo_id=5197653938998550234,
+            caption=types.PageCaption(text=types.TextEmpty(), credit=types.TextEmpty()),
+            spoiler=False,
+            url=None,
+            webpage_id=None,
+        ),
+        types.PageBlockParagraph(text=_plain("Первый абзац.")),
+        types.PageBlockParagraph(text=_plain("Второй абзац.")),
+    )
+
+
+# Low-level block-to-text rendering (rich_text_to_markdown, page_block_to_markdown,
+# ...) is this fork's own code, split into telegram_mcp/rich_messages.py, and is
+# covered by tests/test_rich_message_reading.py. What's left here is the
+# integration: message_to_dict and format_message_line must still fall back to
+# rich content when plain text is empty.
+
+
+def test_message_to_dict_falls_back_to_rich_message():
+    d = messages.message_to_dict(_msg(rich_message=_post_like_agents_lab_224()))
+
+    assert "Личная CRM" in d["text"]
+    assert "rich_message" in d
+
+
+def test_format_message_line_falls_back_to_rich_message():
+    line = messages.format_message_line(_msg(rich_message=_post_like_agents_lab_224()))
+
+    assert "Message: [empty]" not in line
+    assert "Личная CRM" in line
+    assert "Первый абзац" in line
+    assert "rich" in line
+
+
+def test_plain_message_text_still_wins_over_rich_message():
+    msg = _msg(message="обычный текст", rich_message=_post_like_agents_lab_224())
+
+    assert messages.message_to_dict(msg)["text"] == "обычный текст"
+    assert "обычный текст" in messages.format_message_line(msg)

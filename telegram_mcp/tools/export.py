@@ -165,7 +165,8 @@ async def start_chat_export(
             ensure_ascii=False,
         )
     except ExportError as error:
-        return _fail("invalid_request", str(error))
+        detail = str(error)
+        return _fail("invalid_request", detail)
     except Exception as error:  # noqa: BLE001 - tool boundary
         return log_and_format_error("start_chat_export", error, chats=chats)  # noqa: F405
 

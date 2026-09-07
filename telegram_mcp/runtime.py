@@ -12,18 +12,18 @@ from contextlib import contextmanager
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union, Any, get_args
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.types import Annotations, TextContent, ToolAnnotations
+from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.types import Annotations, ImageContent, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
 from pythonjsonlogger import jsonlogger
 from telethon import TelegramClient, functions, types, utils
-from telethon.errors import AuthKeyDuplicatedError
+from telethon.errors import AuthKeyDuplicatedError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     User,
@@ -52,6 +52,8 @@ try:
     import fcntl  # POSIX advisory locks; unavailable on Windows
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
+
+from telegram_mcp.singleton import try_lock_exclusive
 
 from functools import wraps
 import telethon.errors.rpcerrorlist
@@ -113,6 +115,33 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
     return None
 
 
+def parse_schedule_date(
+    schedule_date: Union[str, int],
+) -> tuple[Optional[datetime], Optional[str]]:
+    """Return (datetime, None) for a usable schedule_date, or (None, error message).
+
+    Accepts an ISO-8601 string or a Unix timestamp; naive datetimes are UTC.
+    """
+    try:
+        if isinstance(schedule_date, int):
+            dt = datetime.fromtimestamp(schedule_date, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(schedule_date).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None, (
+            "schedule_date could not be parsed. Use an ISO-8601 date/time or Unix timestamp."
+        )
+
+    now = datetime.now(timezone.utc)
+    if dt <= now:
+        return None, (
+            f"schedule_date must be in the future (got {dt.isoformat()}, now {now.isoformat()})."
+        )
+    return dt, None
+
+
 load_dotenv()
 
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
@@ -143,7 +172,8 @@ def _install_annotation_hook() -> None:
                 response.root.content = [
                     (
                         block.model_copy(update={"annotations": _USER_AUDIENCE})
-                        if isinstance(block, TextContent) and block.annotations is None
+                        if isinstance(block, (TextContent, ImageContent))
+                        and block.annotations is None
                         else block
                     )
                     for block in content
@@ -241,6 +271,7 @@ _PROXY_TYPES_ALL = client_factory.PROXY_TYPES_ALL
 _get_proxy_env = client_factory.get_proxy_env
 _parse_bool_env = client_factory.parse_bool_env
 _build_proxy_for_label = client_factory.build_proxy_for_label
+_get_flood_sleep_threshold = client_factory.get_flood_sleep_threshold
 _build_client = client_factory.build_client
 
 
@@ -278,11 +309,6 @@ def _parse_session_pool() -> List[str]:
 
 def _acquire_session(pool: List[str]) -> str:
     """Claim the first free session in the pool via an advisory file lock."""
-    if fcntl is None:
-        # No advisory locks (e.g. Windows): can't coordinate slots, so use the
-        # first session. For concurrent clients there, prefer distinct
-        # TELEGRAM_SESSION_STRING_<LABEL> accounts instead.
-        return pool[0]
     lock_dir = os.path.join(tempfile.gettempdir(), "telegram-mcp-session-locks")
     try:
         os.makedirs(lock_dir, exist_ok=True)
@@ -292,9 +318,12 @@ def _acquire_session(pool: List[str]) -> str:
         digest = hashlib.sha1(session.encode("utf-8")).hexdigest()[:16]
         lock_path = os.path.join(lock_dir, f"session-{digest}.lock")
         try:
-            fh = open(lock_path, "w")
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # "a+", not "w": on Windows the lock covers the first byte, and
+            # truncating a file another live client holds is refused.
+            fh = open(lock_path, "a+")
         except OSError:
+            continue
+        if not try_lock_exclusive(fh):
             # Locked by another live client — try the next session.
             try:
                 fh.close()
@@ -303,6 +332,8 @@ def _acquire_session(pool: List[str]) -> str:
             continue
         _SESSION_LOCKS.append(fh)
         try:
+            fh.seek(0)
+            fh.truncate()
             fh.write(f"pid={os.getpid()}\n")
             fh.flush()
         except OSError:
@@ -431,7 +462,14 @@ def with_account(readonly=False):
                 return label, await fn(*args, **kw)
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
-            return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
+            if all(isinstance(result, str) for _, result in results):
+                return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
+
+            account_labelled_content = []
+            for label, result in results:
+                account_labelled_content.append(f"[{label}]")
+                account_labelled_content.extend(result if isinstance(result, list) else [result])
+            return account_labelled_content
 
         return wrapper
 
@@ -543,12 +581,12 @@ try:
     # Add handlers to logger
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
-    logger.info(f"Logging initialized to {log_file_path}")
-except Exception as log_error:
-    print(f"WARNING: Error setting up log file: {log_error}", file=sys.stderr)
+    logger.info("Logging initialized")
+except Exception:
+    print("WARNING: Error setting up log file; using console logging only.", file=sys.stderr)
     # Fallback to console-only logging
     logger.addHandler(console_handler)
-    logger.error(f"Failed to set up log file handler: {log_error}")
+    logger.error("Failed to set up log file handler; using console logging only.")
 
 
 # File-path tool security configuration
@@ -562,6 +600,7 @@ EXTENSION_ALLOWLISTS: dict[str, set[str]] = {
     "edit_chat_photo": {".jpg", ".jpeg", ".png", ".webp"},
 }
 MAX_FILE_BYTES: dict[str, int] = {
+    "download_media": 200 * 1024 * 1024,  # 200 MB
     "send_file": 200 * 1024 * 1024,  # 200 MB
     "upload_file": 200 * 1024 * 1024,
     "send_voice": 100 * 1024 * 1024,
@@ -591,6 +630,23 @@ class ErrorCategory(str, Enum):
     FOLDER = "FOLDER"
 
 
+def _is_flood_wait(error: Exception) -> bool:
+    """True for Telethon FloodWaitError."""
+    try:
+        return isinstance(error, FloodWaitError)
+    except Exception:  # telethon missing or moved — not this helper's problem
+        return False
+
+
+def _is_schema_drift(error: Exception) -> bool:
+    """True for TypeNotFoundError — the installed TL schema is older than what the server sends."""
+    try:
+        from telethon.errors.common import TypeNotFoundError
+    except Exception:  # telethon missing or moved — not this helper's problem
+        return False
+    return isinstance(error, TypeNotFoundError)
+
+
 def log_and_format_error(
     function_name: str,
     error: Exception,
@@ -609,7 +665,7 @@ def log_and_format_error(
         prefix: Error code prefix (e.g., ErrorCategory.CHAT, "VALIDATION-001").
             If None, it will be derived from the function_name.
         user_message: A custom user-facing message to return. If None, a generic one is created.
-        **kwargs: Additional context parameters to include in the log.
+        **kwargs: Additional context parameters. These are never written to persistent logs.
 
     Returns:
         A user-friendly error message with an error code.
@@ -634,11 +690,25 @@ def log_and_format_error(
         prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
         error_code = f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
 
-    # Format the additional context parameters
-    context = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+    # Telegram FloodWait (Rate Limiting) must be explicitly formatted for LLM agents.
+    # LLMs will blindly retry generic errors, escalating the flood penalty and risking bans.
+    # Log only a categorical warning; the user-facing response below carries the
+    # actionable wait duration. The persistent error-file handler intentionally
+    # does not store WARNING records.
+    if _is_flood_wait(error):
+        seconds = getattr(error, "seconds", None) or 0
+        logger.warning("Telegram FloodWait; retry only after the reported delay.")
+        if user_message:
+            return user_message
+        wait_clause = f"{seconds} seconds" if seconds > 0 else "an unknown duration"
+        return (
+            f"Rate limit exceeded (FloodWait): Telegram requires waiting {wait_clause} "
+            f"before repeating this operation. Do NOT retry immediately (code: {error_code})."
+        )
 
-    # Log the full technical error
-    logger.error(f"Error in {function_name} ({context}) - Code: {error_code}", exc_info=True)
+    # Keep persistent logs useful without recording exception text, tracebacks,
+    # identifiers, user content, provider payloads, or local paths.
+    logger.error("Telegram MCP operation failed; see the returned stable error code.")
 
     # Return a user-friendly message
     if user_message:
@@ -652,21 +722,12 @@ def log_and_format_error(
     if _is_schema_drift(error):
         return (
             f"MTProto schema mismatch: the installed Telethon does not know an object the "
-            f"server sent ({error}). This is NOT a missing user or chat — the data arrived, "
+            f"server sent. This is NOT a missing user or chat — the data arrived, "
             f"parsing it failed. Upgrade Telethon; if it is already the latest release, its "
             f"schema is behind the current layer (code: {error_code})."
         )
 
-    return f"An error occurred (code: {error_code}). Check mcp_errors.log for details."
-
-
-def _is_schema_drift(error: Exception) -> bool:
-    """True for TypeNotFoundError — the installed TL schema is older than what the server sends."""
-    try:
-        from telethon.errors.common import TypeNotFoundError
-    except Exception:  # telethon missing or moved — not this helper's problem
-        return False
-    return isinstance(error, TypeNotFoundError)
+    return f"An error occurred (code: {error_code})."
 
 
 def validate_id(*param_names_to_validate):
@@ -827,11 +888,14 @@ def load_aliases(strict: bool = False) -> Dict[str, Dict[str, Any]]:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, TypeError) as error:
-        logger.warning("Ignoring unreadable aliases file %s: %s", path, error)
+        logger.warning("Ignoring unreadable aliases file; saved aliases were not changed.")
         if strict:
             # Refuse to write over data we could not read: a degraded read plus a
             # write-back would silently delete every alias in the file.
-            raise AliasStoreUnreadable(str(error)) from error
+            raise AliasStoreUnreadable(
+                "Saved contacts could not be read; no changes were written. "
+                "Check the aliases file and retry."
+            ) from error
         return {}
 
     records: Dict[str, Dict[str, Any]] = {}
@@ -1518,10 +1582,7 @@ async def _get_effective_allowed_roots_with_status(
     except Exception as error:
         recovered_roots = _coerce_paths_from_list_roots_validation_error(error)
         if recovered_roots:
-            logger.warning(
-                "MCP client returned non-URI roots; recovered %d path(s) from validation error.",
-                len(recovered_roots),
-            )
+            logger.warning("MCP client returned non-URI roots; recovered validated paths.")
             return recovered_roots, ROOTS_STATUS_READY
         if _is_roots_unsupported_error(error):
             if fallback_roots:
@@ -1533,12 +1594,9 @@ async def _get_effective_allowed_roots_with_status(
             logger.warning(
                 "MCP roots request failed; falling back to server CLI roots "
                 "(TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK).",
-                exc_info=True,
             )
             return fallback_roots, ROOTS_STATUS_SERVER_FALLBACK
-        logger.error(
-            "MCP roots request failed; disabling file-path tools for safety.", exc_info=True
-        )
+        logger.error("MCP roots request failed; disabling file-path tools for safety.")
         return [], ROOTS_STATUS_ERROR
 
     client_roots: List[Path] = []
@@ -1690,7 +1748,10 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
     for raw_root in parsed.allowed_roots:
         root = Path(raw_root).expanduser()
         if not root.exists():
-            raise SystemExit(f"Allowed root does not exist: {root}")
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                raise SystemExit(f"Allowed root does not exist: {root}")
         resolved = root.resolve(strict=True)
         resolved_roots.append(resolved)
 

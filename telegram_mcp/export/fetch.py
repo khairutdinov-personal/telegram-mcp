@@ -63,7 +63,7 @@ async def resolve_target(client: Any, target: str) -> Any:
         try:
             return await client.get_entity(int(raw))
         except Exception as exc:
-            raise ExportError(f"Cannot resolve chat id {raw}: {exc}")
+            raise ExportError(f"Cannot resolve chat id {raw}.") from exc
 
     try:
         return await client.get_entity(raw)

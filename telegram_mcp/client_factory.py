@@ -9,6 +9,7 @@ Credentials are read at call time rather than at import, so importing this
 module never fails and error messages surface where they can be reported.
 """
 
+import logging
 import os
 from typing import Any, Optional
 
@@ -16,6 +17,8 @@ from telethon import TelegramClient
 
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.errors import ValidationError
+
+logger = logging.getLogger("telegram_mcp")
 
 PROXY_TYPES_SOCKS_HTTP = {"socks5", "socks4", "http"}
 PROXY_TYPES_ALL = PROXY_TYPES_SOCKS_HTTP | {"mtproxy"}
@@ -123,14 +126,30 @@ def build_proxy_for_label(label: str) -> tuple[Optional[Any], Optional[Any]]:
     return proxy, None
 
 
+def get_flood_sleep_threshold() -> int:
+    """Read TELEGRAM_FLOOD_SLEEP_THRESHOLD from environment (default: 60)."""
+    raw = os.getenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "60").strip()
+    try:
+        val = int(raw)
+        if val < 0:
+            logger.warning("Negative TELEGRAM_FLOOD_SLEEP_THRESHOLD clamped to 0 (fail-fast mode)")
+            return 0
+        return val
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_FLOOD_SLEEP_THRESHOLD; falling back to default 60s")
+        return 60
+
+
 def build_client(session: Any, label: str) -> TelegramClient:
-    """Construct a ``TelegramClient`` honoring per-label proxy configuration."""
+    """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
     proxy, connection = build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
         kwargs["proxy"] = proxy
     if connection is not None:
         kwargs["connection"] = connection
+    # Read flood sleep threshold dynamically so runtime env changes take effect
+    kwargs["flood_sleep_threshold"] = get_flood_sleep_threshold()
     kwargs.update(client_identity_kwargs())
     api_id, api_hash = api_credentials()
     return TelegramClient(session, api_id, api_hash, **kwargs)
