@@ -17,12 +17,8 @@ async def list_accounts() -> str:
             raw_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "Unknown"
             name = sanitize_name(raw_name)
             phone = me.phone or "N/A"
-            status = getattr(me, "status", None)
-            if status:
-                status_str = type(status).__name__.replace("UserStatus", "").lower()
-            else:
-                status_str = "unknown"
-            lines.append(f"{label}: {name} (+{phone}) — {status_str}")
+            # No presence: the MCP client never goes online, so it would always read "offline".
+            lines.append(f"{label}: {name} (+{phone})")
         except Exception:
             lines.append(f"{label}: (unable to fetch profile)")
     return "\n".join(lines)
