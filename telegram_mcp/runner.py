@@ -244,6 +244,7 @@ async def _main() -> None:
 
         async def _warm_caches() -> None:
             async def _warm_client(label: str, cl: TelegramClient) -> None:
+                _runtime.note_dialogs_warmed(cl)  # a miss right after startup is a real miss
                 try:
                     await cl.get_dialogs()
                 except BotMethodInvalidError:

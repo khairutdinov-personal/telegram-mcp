@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import asyncio
+import weakref
 import sqlite3
 import logging
 import mimetypes
@@ -1946,14 +1947,67 @@ def alias_failure(original: Any, identifier: Any) -> Optional[AliasNeedsUser]:
     )
 
 
+# A StringSession has no persistent entity cache, so a lookup that misses the in-memory
+# cache is answered by re-fetching the whole dialog list. Unbounded, a burst of misses
+# (a deleted chat, a typo, an agent probing ids) re-downloads that list every time and
+# runs into FLOOD_WAIT. Re-warming is limited to once per interval per client; the
+# interval is TELEGRAM_DIALOG_WARM_MIN_INTERVAL_MINUTES (0 turns the limit off).
+_DIALOG_WARM_INTERVAL_ENV = "TELEGRAM_DIALOG_WARM_MIN_INTERVAL_MINUTES"
+_DEFAULT_DIALOG_WARM_INTERVAL_MINUTES = 5.0
+_dialog_warm_at: "weakref.WeakKeyDictionary[Any, float]" = weakref.WeakKeyDictionary()
+_dialog_warm_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _dialog_warm_interval_seconds() -> float:
+    raw = os.getenv(_DIALOG_WARM_INTERVAL_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_DIALOG_WARM_INTERVAL_MINUTES * 60
+    try:
+        minutes = float(raw)
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_DIALOG_WARM_MIN_INTERVAL_MINUTES; using the default")
+        return _DEFAULT_DIALOG_WARM_INTERVAL_MINUTES * 60
+    if minutes < 0:
+        logger.warning("Negative TELEGRAM_DIALOG_WARM_MIN_INTERVAL_MINUTES clamped to 0")
+        return 0.0
+    return minutes * 60
+
+
+def note_dialogs_warmed(client) -> None:
+    """Record that ``client`` just fetched its dialogs (the startup warm-up calls this)."""
+    _dialog_warm_at[client] = time.monotonic()
+
+
+async def warm_dialogs(client) -> bool:
+    """Re-fetch the dialog list to refill the entity cache, at most once per interval.
+
+    Returns True when a fetch was attempted. A failed attempt (FLOOD_WAIT, a bot
+    account where dialogs are forbidden) counts too, so a struggling account is not
+    hit again straight away. Concurrent misses share one fetch: the later ones wait
+    on the lock, then find the cache freshly warmed and skip.
+    """
+    lock = _dialog_warm_locks.setdefault(client, asyncio.Lock())
+    async with lock:
+        interval = _dialog_warm_interval_seconds()
+        last = _dialog_warm_at.get(client)
+        if interval > 0 and last is not None and time.monotonic() - last < interval:
+            return False
+        note_dialogs_warmed(client)
+        try:
+            await client.get_dialogs()
+        except (BotMethodInvalidError, Exception):
+            pass
+        return True
+
+
 async def _resolve_with_retries(
     getter: str, identifier: Union[int, str], client, label: str, try_marked: bool = True
 ):
     """Cache warming, reconnect, and marked-ID fallback shared by both resolvers.
 
     StringSession has no persistent entity cache, so a cold lookup raises ValueError;
-    warming via get_dialogs() and retrying fixes it. A bare positive ID may also need
-    Telethon's marked chat/channel variants.
+    warming via get_dialogs() and retrying fixes it (rate-limited, see warm_dialogs). A
+    bare positive ID may also need Telethon's marked chat/channel variants.
     """
     await ensure_connected(client)
     get = getattr(client, getter)
@@ -1963,10 +2017,7 @@ async def _resolve_with_retries(
             return await get(identifier)
         except ValueError as error:
             last_error = error
-            try:
-                await client.get_dialogs()
-            except (BotMethodInvalidError, Exception):
-                pass
+            await warm_dialogs(client)
             try:
                 return await get(identifier)
             except ValueError as error:
@@ -1977,10 +2028,7 @@ async def _resolve_with_retries(
             return await get(identifier)
         except ValueError as error:
             last_error = error
-            try:
-                await client.get_dialogs()
-            except (BotMethodInvalidError, Exception):
-                pass
+            await warm_dialogs(client)
             try:
                 return await get(identifier)
             except ValueError as error:

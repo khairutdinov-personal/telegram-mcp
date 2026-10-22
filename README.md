@@ -425,6 +425,12 @@ Use `TELEGRAM_FLOOD_SLEEP_THRESHOLD` to configure Telethon's internal silent-sle
 TELEGRAM_FLOOD_SLEEP_THRESHOLD=60   # Max seconds Telethon sleeps silently on FloodWait (default 60)
 ```
 
+A `StringSession` keeps no entity cache on disk, so a lookup that misses the in-memory cache re-fetches the whole dialog list (`get_dialogs()`). To keep a burst of misses (a deleted chat, a mistyped id) from re-downloading that list every time and hitting `FLOOD_WAIT`, the re-fetch happens at most once per interval per client. The startup warm-up counts as the first fetch:
+
+```env
+TELEGRAM_DIALOG_WARM_MIN_INTERVAL_MINUTES=5   # Minimum minutes between dialog-list re-fetches per client (default 5, 0 = no limit)
+```
+
 Run the server locally:
 
 ```bash
