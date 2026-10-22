@@ -1,6 +1,9 @@
 """Regression tests for privacy-safe Telegram MCP error logging."""
 
 import ast
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -278,7 +281,7 @@ async def test_profile_resolution_warning_omits_identifier_and_exception(monkeyp
             key="status", allow_users=["@profile_user_secret"]
         )
 
-    assert result == "Privacy settings for status updated successfully."
+    assert result == "Error: Could not find a requested user; privacy settings were not changed."
     assert "profile-exception-secret" not in caplog.text
     assert "profile_user_secret" not in caplog.text
 
@@ -330,3 +333,24 @@ async def test_gif_fallback_error_omits_exception_and_query_payload(monkeypatch)
     assert result.startswith("An error occurred (code:")
     assert "exception-payload-secret" not in result
     assert "gif-query-secret" not in result
+
+
+def test_error_code_is_stable_across_processes():
+    # The code is derived from the tool name. str hash() is salted per process, so it used
+    # to change after every server restart; two processes must now agree.
+    code = (
+        "from telegram_mcp import runtime;"
+        "print(runtime.log_and_format_error('leave_chat', RuntimeError('boom')))"
+    )
+    outputs = {
+        subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            check=True,
+        ).stdout.strip()
+        for seed in ("1", "2", "3")
+    }
+
+    assert outputs == {"An error occurred (code: CHAT-ERR-954)."}

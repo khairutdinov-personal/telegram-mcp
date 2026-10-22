@@ -3,6 +3,7 @@
 import asyncio
 import os
 import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -446,8 +447,53 @@ async def test_transcribe_via_groq_success(monkeypatch):
 
     assert result == {"status": "ok", "text": "hello world", "lang": "ru"}
     assert calls[0]["headers"]["Authorization"] == "Bearer test-key"
-    assert calls[0]["files"]["file"][0] == "voice.oga"
+    assert calls[0]["files"]["file"][0] == "voice.ogg"
     assert calls[0]["data"]["model"] == transcription.GROQ_MODEL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ext_in,expected_filename",
+    [
+        (".oga", "voice.ogg"),
+        ("oga", "voice.ogg"),
+        (".ogg", "voice.ogg"),
+        (".mp3", "voice.mp3"),
+        (".wav", "voice.wav"),
+        (None, "voice.ogg"),
+    ],
+)
+async def test_transcribe_via_groq_normalizes_audio_file_extension(
+    monkeypatch, ext_in, expected_filename
+):
+    """Groq API audio transcription only accepts [flac mp3 mp4 mpeg mpga m4a ogg opus wav webm].
+    Telegram voice notes arrive as .oga, which Groq rejects with 400
+    unsupported_audio_format.
+    Naming the upload as .ogg satisfies Groq while preserving the identical
+    audio content (issue #219).
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    calls = []
+    response = _FakeGroqResponse({"text": "ok", "language": "en"})
+    monkeypatch.setattr(
+        transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(response, calls)
+    )
+
+    file_obj = (
+        SimpleNamespace(duration=10, ext=ext_in, mime_type="audio/ogg")
+        if ext_in is not None
+        else None
+    )
+    msg = _voice_msg(file=file_obj)
+
+    async def _download_media(m, file=None):
+        return b"audio-bytes"
+
+    client = SimpleNamespace(download_media=_download_media)
+    result = await transcription._transcribe_via_groq(client, msg)
+
+    assert result["status"] == "ok"
+    assert calls[0]["files"]["file"][0] == expected_filename
 
 
 @pytest.mark.asyncio
@@ -789,3 +835,262 @@ async def test_recording_within_the_limit_still_uploads(monkeypatch):
     result = await transcription._transcribe_via_groq(cl, msg)
 
     assert result == {"status": "ok", "text": "transcribed", "lang": "ru"}
+
+
+# ---------------------------------------------------------------------------
+# Custom engines: openai-compatible (incl. self-hosted Parakeet), local whisper
+# ---------------------------------------------------------------------------
+
+
+def _bytes_client(payload=b"raw-audio-bytes"):
+    async def _download_media(m, file=None):
+        assert file is bytes
+        return payload
+
+    return SimpleNamespace(download_media=_download_media)
+
+
+@pytest.mark.parametrize("engine", ["openai", "whisper"])
+def test_default_engine_accepts_new_engines(monkeypatch, engine):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_ENGINE", engine)
+    assert transcription.default_engine() == engine
+
+
+@pytest.mark.parametrize(
+    "base,expected",
+    [
+        ("https://api.openai.com/v1", "https://api.openai.com/v1/audio/transcriptions"),
+        ("http://localhost:5092/v1/", "http://localhost:5092/v1/audio/transcriptions"),
+        (
+            "https://x.example/v1/audio/transcriptions",
+            "https://x.example/v1/audio/transcriptions",
+        ),
+    ],
+)
+def test_endpoint_accepts_base_or_full_url(base, expected):
+    assert transcription._endpoint(base) == expected
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_keyless_server_with_language_hint(monkeypatch):
+    """E.g. a local Parakeet server: no auth, and it assumes English unless
+    told otherwise."""
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "NL")
+    calls = []
+    response = _FakeGroqResponse({"text": " hallo daar ", "language": "nl"})
+    monkeypatch.setattr(
+        transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(response, calls)
+    )
+
+    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "openai")
+
+    assert result == {"status": "ok", "text": "hallo daar", "lang": "nl"}
+    assert calls[0]["url"] == "http://localhost:5092/v1/audio/transcriptions"
+    assert calls[0]["headers"] == {}
+    assert calls[0]["data"]["language"] == "nl"
+    assert calls[0]["files"]["file"][0] == "voice.ogg"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_oversized_recording_names_its_own_limit(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB", "1")
+    msg = _voice_msg(
+        file=SimpleNamespace(duration=900, ext=".oga", mime_type="audio/ogg", size=3 * 1048576)
+    )
+
+    result = await transcription.transcribe(_bytes_client(), None, msg, "openai")
+
+    assert result["reason"] == "too_large"
+    assert "OpenAI-compatible" in result["error"]
+    assert "TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_uses_configured_url_key_and_model(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "https://api.example.com/v1/")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_MODEL", "gpt-4o-mini-transcribe")
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_LANGUAGE", raising=False)
+    calls = []
+    timeouts = []
+    response = _FakeGroqResponse({"text": " hi "})
+
+    def _client(**kw):
+        timeouts.append(kw.get("timeout"))
+        return _FakeHttpxClient(response, calls)
+
+    monkeypatch.setattr(transcription.httpx, "AsyncClient", _client)
+
+    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "openai")
+
+    assert result == {"status": "ok", "text": "hi", "lang": None}
+    assert calls[0]["url"] == "https://api.example.com/v1/audio/transcriptions"
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-test"
+    assert calls[0]["data"] == {"model": "gpt-4o-mini-transcribe", "response_format": "json"}
+    assert timeouts == [transcription.HTTP_DEFAULT_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_without_url_is_config_error_and_skips_download(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", raising=False)
+
+    async def _download(*args, **kwargs):
+        raise AssertionError("downloaded audio for an engine that cannot run")
+
+    result = await transcription.transcribe(
+        SimpleNamespace(download_media=_download), None, _voice_msg(), "openai"
+    )
+
+    assert result["status"] == "error"
+    assert "TELEGRAM_TRANSCRIBE_OPENAI_URL" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_http_failure_is_error(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://local:8000/v1")
+
+    class _Boom:
+        def raise_for_status(self):
+            raise RuntimeError("500 Internal Server Error")
+
+    monkeypatch.setattr(
+        transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(_Boom(), [])
+    )
+
+    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "openai")
+
+    assert result["status"] == "error"
+    assert "openai request failed" in result["error"]
+
+
+def test_engine_config_error(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", raising=False)
+    monkeypatch.setattr(transcription, "whisper_available", lambda: False)
+
+    assert "GROQ_API_KEY" in transcription.engine_config_error("groq")
+    assert "TELEGRAM_TRANSCRIBE_OPENAI_URL" in transcription.engine_config_error("openai")
+    assert "faster-whisper" in transcription.engine_config_error("whisper")
+    assert transcription.engine_config_error("telegram") is None
+
+
+class _FakeWhisperModel:
+    instances = []
+
+    def __init__(self, name, device=None, compute_type=None, download_root=None):
+        self.args = (name, device, compute_type, download_root)
+        self.calls = []
+        _FakeWhisperModel.instances.append(self)
+
+    def transcribe(self, audio, language=None, vad_filter=False):
+        self.calls.append({"audio": audio.read(), "language": language})
+        segments = (SimpleNamespace(text=t) for t in [" hallo", " wereld "])
+        return segments, SimpleNamespace(language="nl")
+
+
+@pytest.fixture
+def fake_whisper(monkeypatch):
+    import sys
+
+    _FakeWhisperModel.instances = []
+    monkeypatch.setitem(
+        sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=_FakeWhisperModel)
+    )
+    monkeypatch.setattr(transcription, "whisper_available", lambda: True)
+    monkeypatch.setattr(transcription, "_WHISPER_MODELS", {})
+    monkeypatch.setattr(transcription, "_WHISPER_SEMAPHORE", None)
+    return _FakeWhisperModel
+
+
+@pytest.mark.asyncio
+async def test_whisper_transcribes_locally_and_reuses_the_model(monkeypatch, fake_whisper):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_MODEL", "large-v3-turbo")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_DEVICE", "cpu")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_COMPUTE_TYPE", "int8")
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_WHISPER_MODEL_DIR", raising=False)
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_LANGUAGE", raising=False)
+
+    def _no_http(**kw):
+        raise AssertionError("whisper engine must not make HTTP calls")
+
+    monkeypatch.setattr(transcription.httpx, "AsyncClient", _no_http)
+
+    first = await transcription.transcribe(_bytes_client(b"audio"), None, _voice_msg(), "whisper")
+    second = await transcription.transcribe(_bytes_client(b"audio"), None, _voice_msg(), "whisper")
+
+    assert first == {"status": "ok", "text": "hallo wereld", "lang": "nl"}
+    assert second["status"] == "ok"
+    assert len(fake_whisper.instances) == 1
+    model = fake_whisper.instances[0]
+    assert model.args == ("large-v3-turbo", "cpu", "int8", None)
+    assert model.calls[0] == {"audio": b"audio", "language": None}
+
+
+@pytest.mark.asyncio
+async def test_whisper_passes_language_hint(monkeypatch, fake_whisper):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "nl")
+
+    await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
+
+    assert fake_whisper.instances[0].calls[0]["language"] == "nl"
+
+
+@pytest.mark.asyncio
+async def test_whisper_not_installed_is_error(monkeypatch):
+    monkeypatch.setattr(transcription, "whisper_available", lambda: False)
+
+    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
+
+    assert result["status"] == "error"
+    assert "telegram-mcp[whisper]" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_whisper_inference_failure_is_error(monkeypatch, fake_whisper):
+    def _explode(self, audio, language=None, vad_filter=False):
+        raise RuntimeError("bad audio")
+
+    monkeypatch.setattr(_FakeWhisperModel, "transcribe", _explode)
+
+    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
+
+    assert result["status"] == "error"
+    assert "bad audio" in result["error"]
+
+
+def test_default_cache_falls_back_to_a_user_cache_when_cwd_is_unusable(tmp_path, monkeypatch):
+    # A server started by an MCP client often has a read-only working directory. A regular
+    # file named "data" makes the relative default unusable even for root.
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    (workdir / "data").write_text("not a directory")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", raising=False)
+
+    path = transcription.cache_dir()
+
+    assert path == home / ".cache" / "telegram-mcp" / "transcripts"
+    assert path.is_dir()
+
+
+def test_default_cache_stays_in_the_working_directory_when_it_is_writable(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", raising=False)
+
+    assert transcription.cache_dir() == Path("data/transcripts")
+    assert (tmp_path / "data" / "transcripts").is_dir()
+
+
+def test_explicit_cache_dir_that_cannot_be_created_still_fails(tmp_path, monkeypatch):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", str(blocker / "cache"))
+
+    with pytest.raises(OSError):
+        transcription.cache_dir()

@@ -63,7 +63,7 @@ async def resolve_target(client: Any, target: str) -> Any:
         try:
             return await client.get_entity(int(raw))
         except Exception as exc:
-            raise ExportError(f"Cannot resolve chat id {raw}.") from exc
+            raise ExportError(f"Cannot resolve chat id {raw}: {exc}")
 
     try:
         return await client.get_entity(raw)
@@ -197,15 +197,9 @@ async def iter_records(
     count = 0
     if people is None:
         people = {}
-    # Imported here, not at module scope: transcription pulls in httpx and the
-    # SQLite cache, and an export without --transcribe should pay for neither.
-    from telethon import utils as tl_utils
-
+    # Imported here, not at module scope: telegram_mcp.transcription pulls in
+    # runtime, which reads the API credentials at import time.
     from telegram_mcp import transcription
-
-    # Only needed to key the transcript cache; an export without
-    # transcription should not depend on the entity shape at all.
-    cache_chat_id = tl_utils.get_peer_id(entity) if transcribe_engine else None
 
     iterator = client.iter_messages(entity, reverse=True, min_id=floor)
     while True:
@@ -261,11 +255,7 @@ async def iter_records(
             record["media"] = info
 
         if transcribe_engine and transcription.is_transcribable(message):
-            # Cache-first: a re-run or a --resume pass does not pay the engine
-            # again for a recording it already transcribed.
-            result = await transcription.transcribe_cached(
-                client, entity, message, transcribe_engine, cache_chat_id
-            )
+            result = await transcription.transcribe(client, entity, message, transcribe_engine)
             if result.get("status") == "ok":
                 record["transcript"] = {
                     "text": result["text"],

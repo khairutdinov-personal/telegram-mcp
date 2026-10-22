@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from telethon import errors
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
+from telegram_mcp.account_labels import canonical_account_label
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
 
@@ -67,6 +68,32 @@ def _check_installation() -> None:
         sys.exit(1)
 
 
+def _stream_can_encode(text: str, stream) -> bool:
+    """True if *stream* can write *text* without raising UnicodeEncodeError."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _harden_stdio() -> None:
+    """Replace unencodable output instead of crashing mid-login.
+
+    On Windows, redirected stdout falls back to the legacy ANSI code page
+    (e.g. cp1252), which cannot encode the QR block characters or non-latin
+    text, so a bare print() raises UnicodeEncodeError and aborts the login.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def _render_qr(qr) -> None:
     import qrcode
 
@@ -77,11 +104,18 @@ def _render_qr(qr) -> None:
     qr_obj.make(fit=True)
     f = io.StringIO()
     qr_obj.print_ascii(out=f, invert=True)
-    print(f.getvalue())
+    art = f.getvalue()
 
-    print("Scan the QR code above with your Telegram app:")
-    print("  Open Telegram > Settings > Devices > Link Desktop Device\n")
-    print(f"Or open this link on a device where you're logged in:\n  {qr.url}\n")
+    if _stream_can_encode(art, sys.stdout):
+        print(art)
+        print("Scan the QR code above with your Telegram app:")
+        print("  Open Telegram > Settings > Devices > Link Desktop Device\n")
+        print(f"Or open this link on a device where you're logged in:\n  {qr.url}\n")
+    else:
+        encoding = getattr(sys.stdout, "encoding", None) or "unknown"
+        print(f"This console ({encoding}) cannot draw the QR code.")
+        print(f"Open this link on a device where you're logged in instead:\n  {qr.url}\n")
+
     print(f"Expires at: {qr.expires.strftime('%H:%M:%S')}")
     print("Waiting for you to scan...")
 
@@ -150,6 +184,7 @@ def _phone_login(client: TelegramClient) -> None:
 
 
 def main() -> None:
+    _harden_stdio()
     args = _parse_args()
     _check_installation()
 
@@ -171,7 +206,8 @@ def main() -> None:
     print("This script will generate a session string for your Telegram account.")
     print("The generated session string can be added to your .env file.")
     print(
-        "\nYour credentials will NOT be stored on any server and are only used for local authentication.\n"
+        "\nYour credentials will NOT be stored on any server and are only "
+        "used for local authentication.\n"
     )
 
     try:
@@ -183,6 +219,9 @@ def main() -> None:
     except EOFError:
         # Non-interactive stdin (piped/scripted runs): fall back to the default label.
         label = ""
+    # The suggested env var must match what the migrator and the server read:
+    # `export TELEGRAM_SESSION_STRING_MY-WORK=...` is not valid shell syntax.
+    label = canonical_account_label(label)
 
     if args.qr:
         method = "1"
@@ -220,13 +259,16 @@ def main() -> None:
 
         try:
             choice = input(
-                "\nWould you like to automatically update your .env file with this session string? (y/N): "
+                "\nWould you like to automatically update your .env file "
+                "with this session string? (y/N): "
             )
         except EOFError:
             choice = "n"
         if choice.lower() == "y":
             try:
-                with open(".env", "r") as file:
+                # python-dotenv reads .env as UTF-8; the locale default
+                # (cp1252, cp1251, cp936 on Windows) can't decode it.
+                with open(".env", "r", encoding="utf-8") as file:
                     env_contents = file.readlines()
 
                 session_string_line_found = False
@@ -239,7 +281,7 @@ def main() -> None:
                 if not session_string_line_found:
                     env_contents.append(f"{env_var}={session_string}\n")
 
-                with open(".env", "w") as file:
+                with open(".env", "w", encoding="utf-8") as file:
                     file.writelines(env_contents)
 
                 print("\n.env file updated successfully!")

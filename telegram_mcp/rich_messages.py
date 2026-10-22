@@ -90,6 +90,10 @@ def rich_text_to_markdown(node: Any) -> str:
         return f"${inner}$"
     if name == "TextImage":
         return "[image]"
+    if name == "TextCustomEmoji":
+        # The alt character is the only text it has; dropping it would silently
+        # eat the emoji a channel used as a bullet or a heading marker.
+        return getattr(node, "alt", "") or ""
 
     # TextAnchor, TextMention, TextHashtag, TextUrl-ish autodetected nodes and
     # anything newer: the inner text is the content, the decoration is not.

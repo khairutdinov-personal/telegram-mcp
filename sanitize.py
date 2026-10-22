@@ -43,14 +43,56 @@ _INVISIBLE_CHARS = re.compile(
 _EXCESSIVE_NEWLINES = re.compile(r"\n{3,}")
 
 
-def sanitize_user_content(text: Optional[str], max_length: int = 4096) -> str:
+# Scripts whose words need U+200C (ZWNJ): Arabic/Persian and the Indic blocks.
+_ZWNJ_SCRIPT_RANGES = ((0x0600, 0x08FF), (0x0900, 0x0DFF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF))
+
+
+def _in_zwnj_script(ch: str) -> bool:
+    return any(low <= ord(ch) <= high for low, high in _ZWNJ_SCRIPT_RANGES)
+
+
+def _is_emoji_part(ch: str) -> bool:
+    """A symbol that can sit next to a ZWJ inside an emoji sequence."""
+    return (
+        unicodedata.category(ch) == "So"
+        or ch == "\ufe0f"  # emoji presentation selector
+        or "\U0001f3fb" <= ch <= "\U0001f3ff"  # skin tone modifiers
+    )
+
+
+def _joiner_glues_text(text: str, index: int) -> bool:
+    """True for a ZWJ/ZWNJ that is part of a word or emoji rather than a hidden character.
+
+    A ZWJ between two emoji parts builds one composite emoji (family, flag, profession);
+    a ZWJ/ZWNJ between two letters of a joining script (Persian, Hindi ...) is spelling.
+    Anywhere else - e.g. between Latin letters, where it could split a word to hide it -
+    they stay stripped.
+    """
+    if index == 0 or index + 1 >= len(text):
+        return False
+    before, after = text[index - 1], text[index + 1]
+    if text[index] == "\u200d" and _is_emoji_part(before) and _is_emoji_part(after):
+        return True
+    return (
+        _in_zwnj_script(before)
+        and _in_zwnj_script(after)
+        and unicodedata.category(before)[0] in "LM"
+        and unicodedata.category(after)[0] in "LM"
+    )
+
+
+def sanitize_user_content(
+    text: Optional[str], max_length: int = 4096, *, preserve_emoji: bool = False
+) -> str:
     """Sanitize user-controlled text content before returning in tool results.
 
     - Returns "[empty]" for None / empty input
     - Strips Unicode control characters (Cc, Cf) except newline and tab
-    - Strips zero-width / invisible characters
+    - Strips zero-width / invisible characters, except a ZWJ inside an emoji sequence or a
+      ZWNJ inside a word of a joining script, which would otherwise break the text
     - Collapses excessive consecutive newlines (>2) to 2
     - Truncates to max_length with a marker
+    - With preserve_emoji, retains every ZWJ and subdivision-flag tag characters
 
     This does NOT attempt keyword-based injection detection (too brittle).
     The real defence is the structural JSON boundary in tool results.
@@ -58,20 +100,21 @@ def sanitize_user_content(text: Optional[str], max_length: int = 4096) -> str:
     if not text:
         return "[empty]"
 
-    # Strip control characters except \n (0x0a) and \t (0x09)
     cleaned = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf"):
+    for i, ch in enumerate(text):
+        if ch in ("\u200c", "\u200d") and _joiner_glues_text(text, i):
+            cleaned.append(ch)
+        elif unicodedata.category(ch) in ("Cc", "Cf"):
+            # Strip control characters except \n (0x0a) and \t (0x09)
             if ch in ("\n", "\t"):
                 cleaned.append(ch)
+            elif preserve_emoji and (ch == "\u200d" or "\U000e0020" <= ch <= "\U000e007f"):
+                cleaned.append(ch)
             # else: drop the character
-        else:
+        elif not _INVISIBLE_CHARS.match(ch):
+            # Zero-width / invisible characters outside Cc/Cf (line/paragraph separators)
             cleaned.append(ch)
     result = "".join(cleaned)
-
-    # Strip invisible / zero-width characters
-    result = _INVISIBLE_CHARS.sub("", result)
 
     # Collapse excessive newlines
     result = _EXCESSIVE_NEWLINES.sub("\n\n", result)
@@ -104,15 +147,21 @@ def sanitize_name(text: Optional[str], max_length: int = 256) -> str:
 
 
 def sanitize_dict(data: Any) -> Any:
-    """Recursively sanitize all string values in a nested dict/list structure.
+    """Recursively sanitize all string and bytes values in a nested dict/list structure.
 
     Use this for raw Telegram API responses (e.g. to_dict()) where
-    user-controlled content can appear at any nesting depth.
+    user-controlled content can appear at any nesting depth. Bytes are
+    decoded (UTF-8, replacing errors) and sanitized as text, matching how
+    they are later serialized to JSON.
     """
     if isinstance(data, dict):
         return {k: sanitize_dict(v) for k, v in data.items()}
     if isinstance(data, list):
         return [sanitize_dict(item) for item in data]
+    if isinstance(data, bytes):
+        # Decode at the sanitization point: _json_default only decodes at
+        # serialization time, which would let control bytes slip through raw.
+        return sanitize_user_content(data.decode("utf-8", errors="replace"), max_length=4096)
     if isinstance(data, str):
         return sanitize_user_content(data, max_length=4096)
     return data

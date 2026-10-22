@@ -74,7 +74,7 @@ def test_flood_sleep_threshold_custom_valid(monkeypatch):
 
 def test_flood_sleep_threshold_negative_clamped_with_warning(monkeypatch):
     monkeypatch.setenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "-5")
-    with patch("telegram_mcp.client_factory.logger") as mock_logger:
+    with patch("telegram_mcp.runtime.logger") as mock_logger:
         assert _get_flood_sleep_threshold() == 0
         mock_logger.warning.assert_called_once()
         assert "Negative TELEGRAM_FLOOD_SLEEP_THRESHOLD" in mock_logger.warning.call_args[0][0]
@@ -82,7 +82,7 @@ def test_flood_sleep_threshold_negative_clamped_with_warning(monkeypatch):
 
 def test_flood_sleep_threshold_invalid_falls_back(monkeypatch):
     monkeypatch.setenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "not_a_number")
-    with patch("telegram_mcp.client_factory.logger") as mock_logger:
+    with patch("telegram_mcp.runtime.logger") as mock_logger:
         assert _get_flood_sleep_threshold() == 60
         mock_logger.warning.assert_called_once()
         assert "Invalid TELEGRAM_FLOOD_SLEEP_THRESHOLD" in mock_logger.warning.call_args[0][0]
@@ -90,9 +90,7 @@ def test_flood_sleep_threshold_invalid_falls_back(monkeypatch):
 
 def test_build_client_passes_flood_sleep_threshold(monkeypatch):
     monkeypatch.setenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "25")
-    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
-    monkeypatch.setenv("TELEGRAM_API_HASH", "dummy_hash")
-    with patch("telegram_mcp.client_factory.TelegramClient") as mock_tc:
+    with patch("telegram_mcp.runtime.TelegramClient") as mock_tc:
         _build_client("dummy_session", "default")
         mock_tc.assert_called_once()
         _, kwargs = mock_tc.call_args

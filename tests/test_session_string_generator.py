@@ -1,4 +1,6 @@
 import asyncio
+import io
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -162,6 +164,52 @@ def test_phone_login_uses_hidden_password_prompt_for_2fa(monkeypatch):
     assert client.sign_in_calls == ["secret"]
 
 
+def _bytes_stdout(encoding):
+    """A strict TextIOWrapper standing in for a redirected console stream."""
+    return io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors="strict", write_through=True)
+
+
+def test_render_qr_prints_ascii_art_when_console_can_encode(monkeypatch):
+    qr = _FakeQR([])
+    stdout = _bytes_stdout("utf-8")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    session_string_generator._render_qr(qr)
+
+    out = stdout.buffer.getvalue().decode("utf-8")
+    assert "▄" in out  # the half-block characters of the QR art
+    assert qr.url in out
+
+
+def test_render_qr_falls_back_to_link_when_console_cannot_encode(monkeypatch):
+    # Redirected stdout on Windows uses the ANSI code page (cp1252), which
+    # cannot encode the QR block characters and used to crash the generator.
+    qr = _FakeQR([])
+    stdout = _bytes_stdout("cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    session_string_generator._render_qr(qr)
+
+    out = stdout.buffer.getvalue().decode("cp1252")
+    assert "cannot draw the QR code" in out
+    assert qr.url in out
+    assert "Waiting for you to scan..." in out
+
+
+def test_harden_stdio_replaces_unencodable_output_instead_of_crashing(monkeypatch):
+    stdout = _bytes_stdout("cp1252")
+    stderr = _bytes_stdout("cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    session_string_generator._harden_stdio()
+    print("session for █Ж█ ready")  # raises under strict cp1252
+
+    out = stdout.buffer.getvalue().decode("cp1252")
+    assert "session for" in out
+    assert "ready" in out
+
+
 def test_parse_args_qr_selects_qr_login(monkeypatch):
     monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
 
@@ -194,3 +242,82 @@ def test_parse_args_rejects_conflicting_login_modes(monkeypatch):
 
     with pytest.raises(SystemExit):
         session_string_generator._parse_args()
+
+
+class _AuthorizedClient:
+    def __init__(self, *args, **kwargs):
+        self.session = object()
+        self.disconnected = False
+
+    def connect(self):
+        pass
+
+    def is_user_authorized(self):
+        return True
+
+    def disconnect(self):
+        self.disconnected = True
+
+
+class _FakeStringSession:
+    def __init__(self, *args):
+        pass
+
+    @staticmethod
+    def save(session):
+        return "NEWSESSION"
+
+
+def test_env_update_keeps_utf8_file_under_windows_locale(monkeypatch, tmp_path):
+    # .env is UTF-8 (python-dotenv reads it that way); the update must not fall
+    # back to the locale encoding, here cp1252 as on an English Windows install.
+    real_open = open
+
+    def locale_open(file, mode="r", *args, encoding=None, **kwargs):
+        if "b" not in mode and encoding is None:
+            encoding = "cp1252"
+        return real_open(file, mode, *args, encoding=encoding, **kwargs)
+
+    env_file = tmp_path / ".env"
+    original = "# Настройки Telegram\nTELEGRAM_API_ID=1\n"
+    env_file.write_text(original, encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(session_string_generator, "open", locale_open, raising=False)
+    monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
+    monkeypatch.setenv("TELEGRAM_API_ID", "1")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+    monkeypatch.setattr(session_string_generator, "_harden_stdio", lambda: None)
+    monkeypatch.setattr(session_string_generator, "_check_installation", lambda: None)
+    monkeypatch.setattr(session_string_generator, "client_identity_kwargs", dict)
+    monkeypatch.setattr(session_string_generator, "TelegramClient", _AuthorizedClient)
+    monkeypatch.setattr(session_string_generator, "StringSession", _FakeStringSession)
+    answers = iter(["", "y"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    session_string_generator.main()
+
+    assert env_file.read_text(encoding="utf-8") == (
+        original + "TELEGRAM_SESSION_STRING=NEWSESSION\n"
+    )
+
+
+def test_dash_account_label_suggests_shell_safe_env_var(monkeypatch, capsys):
+    # The suggested variable must be the one the migrator and the server read:
+    # `export TELEGRAM_SESSION_STRING_MY-WORK=...` is not valid shell syntax.
+    monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
+    monkeypatch.setenv("TELEGRAM_API_ID", "1")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+    monkeypatch.setattr(session_string_generator, "_harden_stdio", lambda: None)
+    monkeypatch.setattr(session_string_generator, "_check_installation", lambda: None)
+    monkeypatch.setattr(session_string_generator, "client_identity_kwargs", dict)
+    monkeypatch.setattr(session_string_generator, "TelegramClient", _AuthorizedClient)
+    monkeypatch.setattr(session_string_generator, "StringSession", _FakeStringSession)
+    answers = iter(["my-work", "n"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    session_string_generator.main()
+
+    out = capsys.readouterr().out
+    assert "TELEGRAM_SESSION_STRING_MY_WORK=NEWSESSION" in out
+    assert "MY-WORK" not in out

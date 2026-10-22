@@ -1,5 +1,8 @@
 import asyncio
 import json
+import logging
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +14,7 @@ from mcp.types import ErrorData, ToolAnnotations
 from telethon.tl.types import Channel, Chat, PeerUser, User
 
 import main
-from telegram_mcp import client_factory, runtime
+from telegram_mcp import runtime
 
 
 def _clear_session_env(monkeypatch):
@@ -60,7 +63,7 @@ def test_apply_exposed_tools_all_keeps_tools():
 
     removed = runtime._apply_exposed_tools_mode(server, "all")
 
-    assert removed == []
+    assert removed == ([], [])
     assert _tool_names(server) == {"read_tool", "write_tool"}
 
 
@@ -69,7 +72,7 @@ def test_apply_exposed_tools_read_only_removes_non_read_only_tools():
 
     removed = runtime._apply_exposed_tools_mode(server, "read-only")
 
-    assert removed == ["write_tool"]
+    assert removed == (["write_tool"], [])
     assert _tool_names(server) == {"read_tool"}
 
 
@@ -83,6 +86,29 @@ def test_get_exposed_tools_mode_rejects_invalid_value(monkeypatch):
     assert "TELEGRAM_EXPOSED_TOOLS" in message
     assert "all" in message
     assert "read-only" in message
+
+
+def test_missing_api_credentials_exit_with_readable_error(monkeypatch, capsys):
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._require_api_credentials()
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "TELEGRAM_API_ID and TELEGRAM_API_HASH must be set" in err
+    assert "my.telegram.org" in err  # hint, not a bare traceback
+
+
+def test_non_integer_api_id_exits_with_readable_error(monkeypatch, capsys):
+    monkeypatch.setenv("TELEGRAM_API_ID", "not-a-number")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+
+    with pytest.raises(SystemExit):
+        runtime._require_api_credentials()
+
+    assert "TELEGRAM_API_ID must be an integer" in capsys.readouterr().err
 
 
 def _synthetic_mcp_with_two_writes():
@@ -106,7 +132,7 @@ def test_apply_exposed_tools_allowlist_keeps_named_write_tools():
 
     removed = runtime._apply_exposed_tools_mode(server, "read-only+send_tool")
 
-    assert removed == ["write_tool"]
+    assert removed == (["write_tool"], [])
     assert _tool_names(server) == {"read_tool", "send_tool"}
 
 
@@ -117,6 +143,7 @@ def test_apply_exposed_tools_allowlist_rejects_unknown_tool():
         runtime._apply_exposed_tools_mode(server, "read-only+send_mesage")
 
     assert "send_mesage" in str(excinfo.value)
+    assert "underscores" not in str(excinfo.value)
     assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
 
 
@@ -134,12 +161,394 @@ def test_get_exposed_tools_mode_rejects_empty_allowlist():
     assert "at least one tool" in str(excinfo.value)
 
 
+# --- "-" exclusion list -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        # Every form that was valid before the "-" list existed normalises as before.
+        ("all", "all"),
+        (" ALL ", "all"),
+        ("read-only", "read-only"),
+        ("Read-Only", "read-only"),
+        ("read-only+send_tool", "read-only+send_tool"),
+        ("read-only+send_tool,,write_tool,", "read-only+send_tool,write_tool"),
+        ("read-only+send_tool,send_tool", "read-only+send_tool,send_tool"),
+        ("read-only+read_tool", "read-only+read_tool"),
+        # New forms.
+        ("all-write_tool", "all-write_tool"),
+        (" All- write_tool , send_tool ", "all-write_tool,send_tool"),
+        ("all-write_tool,write_tool", "all-write_tool,write_tool"),
+        ("read-only-read_tool", "read-only-read_tool"),
+        ("read-only+send_tool-read_tool", "read-only+send_tool-read_tool"),
+        ("read-only+send_tool,write_tool-read_tool,", "read-only+send_tool,write_tool-read_tool"),
+    ],
+)
+def test_get_exposed_tools_mode_normalises(value, expected):
+    assert runtime._get_exposed_tools_mode(value) == expected
+
+
+def test_parse_exposed_tools_mode_reads_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPOSED_TOOLS", "Read-Only+send_tool-read_tool")
+
+    assert runtime._parse_exposed_tools_mode() == ("read-only", ["send_tool"], ["read_tool"])
+
+    monkeypatch.delenv("TELEGRAM_EXPOSED_TOOLS")
+    assert runtime._parse_exposed_tools_mode() == ("all", [], [])
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "none", "allx", "read-onlyx", "read_only", "readonly-write_tool", "-write_tool"],
+)
+def test_get_exposed_tools_mode_rejects_unknown_base(value):
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode(value)
+
+    assert "Expected one of: all, read-only." in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["all-", "read-only-", "read-only+send_tool-", "all- , "])
+def test_get_exposed_tools_mode_rejects_empty_exclusions(value):
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode(value)
+
+    assert "'-' exclusion list must name at least one tool" in str(excinfo.value)
+
+
+def test_get_exposed_tools_mode_rejects_empty_allowlist_before_exclusions():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode("read-only+-read_tool")
+
+    assert "at least one tool" in str(excinfo.value)
+    assert "'+'" in str(excinfo.value)
+
+
+def test_get_exposed_tools_mode_rejects_allowlist_with_all_and_exclusions():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode("all+send_tool-write_tool")
+
+    assert "only valid with read-only" in str(excinfo.value)
+
+
+def test_get_exposed_tools_mode_rejects_tool_in_both_lists():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode("read-only+send_tool,write_tool-write_tool")
+
+    message = str(excinfo.value)
+    assert "both exposed with '+' and excluded with '-'" in message
+    assert "write_tool" in message
+
+
+@pytest.mark.parametrize(
+    "value", ["read-only-read_tool+send_tool", "all-write_tool-send_tool", "all-write_tool+"]
+)
+def test_get_exposed_tools_mode_rejects_misordered_or_repeated_lists(value):
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode(value)
+
+    assert "one '+' list followed by one '-' list" in str(excinfo.value)
+
+
+def test_apply_exposed_tools_all_with_exclusions_removes_only_named_tools():
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "all-write_tool")
+
+    assert result == ([], ["write_tool"])
+    assert _tool_names(server) == {"read_tool", "send_tool"}
+
+
+def test_apply_exposed_tools_all_can_exclude_read_only_tools():
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "all-read_tool,send_tool")
+
+    assert result == ([], ["read_tool", "send_tool"])
+    assert _tool_names(server) == {"write_tool"}
+
+
+def test_apply_exposed_tools_exclusions_accept_repeated_names():
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "all-write_tool,write_tool")
+
+    assert result == ([], ["write_tool"])
+    assert _tool_names(server) == {"read_tool", "send_tool"}
+
+
+def test_apply_exposed_tools_read_only_with_exclusions_hides_read_tools():
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "read-only-read_tool")
+
+    assert result == (["write_tool", "send_tool"], ["read_tool"])
+    assert _tool_names(server) == set()
+
+
+def test_apply_exposed_tools_allowlist_and_exclusions_combine():
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "read-only+send_tool-read_tool")
+
+    assert result == (["write_tool"], ["read_tool"])
+    assert _tool_names(server) == {"send_tool"}
+
+
+def test_apply_exposed_tools_allowlist_accepts_already_exposed_tool():
+    """Unchanged behaviour: naming a read-only tool after '+' is harmless."""
+    server = _synthetic_mcp_with_two_writes()
+
+    result = runtime._apply_exposed_tools_mode(server, "read-only+read_tool,send_tool")
+
+    assert result == (["write_tool"], [])
+    assert _tool_names(server) == {"read_tool", "send_tool"}
+
+
+@pytest.mark.parametrize(
+    "mode", ["all-write_tol", "read-only-read_tol", "read-only+send_tool-read_tol"]
+)
+def test_apply_exposed_tools_exclusions_reject_unknown_tool(mode):
+    server = _synthetic_mcp_with_two_writes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_exposed_tools_mode(server, mode)
+
+    message = str(excinfo.value)
+    assert "exclusion list: unknown tool(s)" in message
+    assert "_tol" in message
+    assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("read-only-write_tool", "write_tool is already hidden by read-only; remove it"),
+        (
+            "read-only-send_tool,write_tool",
+            "send_tool, write_tool are already hidden by read-only; remove them",
+        ),
+    ],
+)
+def test_apply_exposed_tools_rejects_excluding_already_hidden_tool(mode, expected):
+    server = _synthetic_mcp_with_two_writes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_exposed_tools_mode(server, mode)
+
+    message = str(excinfo.value)
+    assert expected in message
+    assert "underscores" not in message
+    assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
+
+
+def test_apply_exposed_tools_hints_at_hyphen_typo_in_allowlist_name():
+    """'+send-tool' splits into '+send' and '-tool'; the error says why."""
+    server = _synthetic_mcp_with_two_writes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_exposed_tools_mode(server, "read-only+send-tool")
+
+    message = str(excinfo.value)
+    assert "allowlist: unknown tool(s) send." in message
+    assert "Tool names use underscores; '-' starts the exclusion list." in message
+    assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
+
+
+def test_apply_exposed_tools_hints_at_hyphen_typo_between_allowlist_names():
+    """'+send_tool-write_tool' meant two '+' names, not an exclusion."""
+    server = _synthetic_mcp_with_two_writes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_exposed_tools_mode(server, "read-only+send_tool-write_tool")
+
+    message = str(excinfo.value)
+    assert "write_tool is already hidden by read-only" in message
+    assert "Tool names use underscores; '-' starts the exclusion list." in message
+    assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
+
+
+def _copy_of_registered_tools():
+    server = FastMCP("copy")
+    for tool in runtime.mcp._tool_manager.list_tools():
+        server._tool_manager._tools[tool.name] = tool
+    return server
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "all-delete_message,delete_messages_bulk",
+        "read-only-get_participants",
+        "read-only+send_message,reply_to_message-get_participants",
+    ],
+)
+def test_apply_exposed_tools_exclusions_on_registered_tools(mode):
+    server = _copy_of_registered_tools()
+    before = _tool_names(server)
+    selected = runtime._parse_exposed_tools_mode(mode)
+    read_only = {
+        tool.name
+        for tool in server._tool_manager.list_tools()
+        if getattr(tool.annotations, "readOnlyHint", False)
+    }
+    base_exposed = before if selected.base == "all" else read_only | set(selected.allowlist)
+
+    hidden, excluded = runtime._apply_exposed_tools_mode(server, mode)
+
+    assert _tool_names(server) == base_exposed - set(selected.exclusions)
+    assert sorted(excluded) == sorted(selected.exclusions)
+    assert set(hidden) == before - base_exposed
+
+
+def _synthetic_mcp_with_file_tools():
+    """A synthetic server exposing tools named like the real file-path tools."""
+    server = _synthetic_mcp()
+
+    @server.tool(annotations=ToolAnnotations(title="Send File", destructiveHint=True))
+    def send_file():
+        return "send_file"
+
+    @server.tool(annotations=ToolAnnotations(title="Upload File", destructiveHint=True))
+    def upload_file():
+        return "upload_file"
+
+    @server.tool(annotations=ToolAnnotations(title="Send Voice", destructiveHint=True))
+    def send_voice():
+        return "send_voice"
+
+    return server
+
+
+@pytest.fixture
+def reset_extension_allowlists(monkeypatch):
+    """Restore runtime.EXTENSION_ALLOWLISTS after a test rebuilds it."""
+    monkeypatch.setattr(runtime, "EXTENSION_ALLOWLISTS", dict(runtime.EXTENSION_ALLOWLISTS))
+    yield
+
+
+def test_get_file_extension_overrides_defaults_to_empty(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_FILE_EXTENSIONS", raising=False)
+
+    assert runtime._get_file_extension_overrides() == {}
+
+
+def test_get_file_extension_overrides_parses_multiple_tools():
+    overrides = runtime._get_file_extension_overrides(
+        "send_file:.pdf,.png,.jpg;upload_file:.pdf,.png"
+    )
+
+    assert overrides == {
+        "send_file": {".pdf", ".png", ".jpg"},
+        "upload_file": {".pdf", ".png"},
+    }
+
+
+def test_get_file_extension_overrides_is_case_insensitive_and_tolerates_missing_dot():
+    overrides = runtime._get_file_extension_overrides("Send_File:.PDF,PNG")
+
+    assert overrides == {"send_file": {".pdf", ".png"}}
+
+
+def test_get_file_extension_overrides_tolerates_blank_entries():
+    overrides = runtime._get_file_extension_overrides(";send_file:.pdf;;upload_file:.png;")
+
+    assert overrides == {"send_file": {".pdf"}, "upload_file": {".png"}}
+
+
+def test_get_file_extension_overrides_rejects_malformed_entry_without_colon():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file.pdf")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_get_file_extension_overrides_rejects_empty_extension_list():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+    assert "send_file" in str(excinfo.value)
+
+
+def test_get_file_extension_overrides_rejects_malformed_extension_token():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:.pdf,.p d f")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_apply_file_extension_overrides_unset_keeps_current_behaviour(
+    monkeypatch, reset_extension_allowlists
+):
+    monkeypatch.delenv("TELEGRAM_FILE_EXTENSIONS", raising=False)
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server)
+
+    assert result == runtime._DEFAULT_EXTENSION_ALLOWLISTS
+    assert runtime.EXTENSION_ALLOWLISTS == runtime._DEFAULT_EXTENSION_ALLOWLISTS
+    assert runtime._ensure_extension_allowed("send_file", Path("any.exe")) is None
+
+
+def test_apply_file_extension_overrides_merges_over_defaults(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server, "send_file:.pdf,.png")
+
+    assert result["send_file"] == {".pdf", ".png"}
+    # Untouched defaults for other tools survive the merge.
+    assert result["send_voice"] == {".ogg", ".opus"}
+    assert runtime._ensure_extension_allowed("send_file", Path("doc.pdf")) is None
+    assert runtime._ensure_extension_allowed("send_file", Path("evil.exe")) is not None
+
+
+def test_apply_file_extension_overrides_replaces_named_default(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server, "send_voice:.mp3")
+
+    assert result["send_voice"] == {".mp3"}
+    assert runtime._ensure_extension_allowed("send_voice", Path("clip.ogg")) is not None
+    assert runtime._ensure_extension_allowed("send_voice", Path("clip.mp3")) is None
+
+
+def test_apply_file_extension_overrides_is_case_insensitive_at_check_time(
+    reset_extension_allowlists,
+):
+    server = _synthetic_mcp_with_file_tools()
+
+    runtime._apply_file_extension_overrides(server, "send_file:.pdf")
+
+    assert runtime._ensure_extension_allowed("send_file", Path("DOC.PDF")) is None
+
+
+def test_apply_file_extension_overrides_rejects_unknown_tool(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_file_extension_overrides(server, "not_a_real_tool:.pdf")
+
+    assert "not_a_real_tool" in str(excinfo.value)
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_apply_file_extension_overrides_rejects_malformed_extension(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_file_extension_overrides(server, "send_file:")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
 def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch):
     _clear_session_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_SESSION_STRING_WORK", "work-session")
     monkeypatch.setenv("TELEGRAM_SESSION_NAME_PERSONAL", "personal.session")
     monkeypatch.setenv("TELEGRAM_SESSION_STRING", "default-session")
-    monkeypatch.setattr(client_factory, "TelegramClient", _FakeTelegramClient)
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
     monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
 
     accounts = runtime._discover_accounts()
@@ -155,6 +564,19 @@ def test_discover_accounts_exits_when_no_sessions_configured(monkeypatch):
 
     with pytest.raises(SystemExit):
         runtime._discover_accounts()
+
+
+def test_discover_accounts_folds_dash_labels_to_underscores(monkeypatch):
+    """MY-WORK and MY_WORK env spellings must land on the same account label."""
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING_MY-WORK", "work-session")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+    monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
+
+    accounts = runtime._discover_accounts()
+
+    assert list(accounts) == ["my_work"]
+    assert accounts["my_work"].args[0] == "StringSession:work-session"
 
 
 def _clear_proxy_env(monkeypatch):
@@ -300,7 +722,7 @@ def test_discover_accounts_passes_proxy_kwargs_to_client(monkeypatch):
     monkeypatch.setenv("TELEGRAM_PROXY_HOST", "mtproxy.example")
     monkeypatch.setenv("TELEGRAM_PROXY_PORT", "443")
     monkeypatch.setenv("TELEGRAM_PROXY_SECRET", "ee0123456789abcdef")
-    monkeypatch.setattr(client_factory, "TelegramClient", _FakeTelegramClient)
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
     monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
 
     accounts = runtime._discover_accounts()
@@ -320,7 +742,7 @@ def test_discover_accounts_passes_device_identity_kwargs_to_client(monkeypatch):
     monkeypatch.setenv("TELEGRAM_SESSION_STRING", "default-session")
     monkeypatch.setenv("TELEGRAM_DEVICE_MODEL", "Telegram MCP")
     monkeypatch.setenv("TELEGRAM_APP_VERSION", "3.1")
-    monkeypatch.setattr(client_factory, "TelegramClient", _FakeTelegramClient)
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
     monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
 
     accounts = runtime._discover_accounts()
@@ -366,6 +788,14 @@ async def test_with_account_routes_single_multi_and_readonly(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_reconnect_state(monkeypatch):
+    """Reconnect state is keyed by id(client), which CPython reuses across tests."""
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+    monkeypatch.setattr(runtime, "_conn_locks", {})
+    monkeypatch.setattr(runtime, "_last_reconnect_failure", {})
+
+
 class _ConnectivityClient:
     def __init__(self, *, connected=True, authorized=True, ping_error=None):
         self.connected = connected
@@ -401,13 +831,40 @@ class _ConnectivityClient:
 
 @pytest.mark.asyncio
 async def test_ensure_connected_reconnects_disconnected_client(monkeypatch):
-    client = _ConnectivityClient(connected=False, authorized=False)
+    client = _ConnectivityClient(connected=False, authorized=True)
     monkeypatch.setattr(runtime, "_last_conn_verified", {})
 
     await runtime.ensure_connected(client)
 
-    assert client.calls == ["is_connected", "disconnect", "connect", "is_user_authorized", "start"]
+    assert client.calls == ["is_connected", "disconnect", "connect", "is_user_authorized"]
     assert runtime._last_conn_verified[id(client)] > 0
+
+
+@pytest.mark.asyncio
+async def test_force_reconnect_never_starts_interactive_login(monkeypatch):
+    client = _ConnectivityClient(connected=False, authorized=False)
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+
+    with pytest.raises(RuntimeError, match="not authorized after reconnect") as excinfo:
+        await runtime._force_reconnect(client)
+
+    assert "session_string_generator.py" in str(excinfo.value)
+    assert "start" not in client.calls
+    # The unauthorized connection is dropped so the next tool call reconnects
+    # and reports the same error instead of reusing a half-open session.
+    assert client.calls == ["disconnect", "connect", "is_user_authorized", "disconnect"]
+    assert id(client) not in runtime._last_conn_verified
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_surfaces_revoked_session(monkeypatch):
+    client = _ConnectivityClient(connected=False, authorized=False)
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+
+    with pytest.raises(RuntimeError, match="not authorized after reconnect"):
+        await runtime.ensure_connected(client)
+
+    assert "start" not in client.calls
 
 
 @pytest.mark.asyncio
@@ -429,6 +886,53 @@ async def test_ensure_connected_skips_recently_verified_client(monkeypatch):
     await runtime.ensure_connected(client)
 
     assert client.calls == ["is_connected"]
+
+
+class _SlowConnectClient(_ConnectivityClient):
+    async def connect(self):
+        await asyncio.sleep(0)
+        await super().connect()
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_reconnects_once_for_concurrent_callers(monkeypatch):
+    client = _SlowConnectClient(connected=False)
+
+    await asyncio.gather(*(runtime.ensure_connected(client) for _ in range(3)))
+
+    assert client.calls.count("connect") == 1
+
+
+class _FailingConnectClient(_ConnectivityClient):
+    async def connect(self):
+        self.calls.append("connect")
+        raise ConnectionError("network down")
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_replays_failed_reconnect_to_waiters():
+    """Callers queued behind a failed reconnect reuse its error instead of retrying (#298)."""
+    client = _FailingConnectClient(connected=False)
+
+    results = await asyncio.gather(
+        *(runtime.ensure_connected(client) for _ in range(3)), return_exceptions=True
+    )
+
+    assert client.calls.count("connect") == 1
+    assert client.calls.count("disconnect") == 1
+    assert all(isinstance(result, ConnectionError) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_retries_reconnect_after_cached_failure_goes_stale():
+    client = _ConnectivityClient(connected=False, authorized=True)
+    stale = runtime.time.time() - 2 * runtime._RECONNECT_FAILURE_TTL
+    runtime._last_reconnect_failure[id(client)] = (stale, RuntimeError("old attempt"))
+
+    await runtime.ensure_connected(client)
+
+    assert "connect" in client.calls
+    assert id(client) not in runtime._last_reconnect_failure
 
 
 class _HangingConnectClient(_ConnectivityClient):
@@ -796,6 +1300,69 @@ async def test_more_file_resolution_edges(tmp_path, monkeypatch):
     assert error == "Path is outside allowed roots."
 
 
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_default_avoids_nested_downloads(tmp_path, monkeypatch):
+    downloads_root = (tmp_path / "Downloads").resolve()
+    downloads_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [downloads_root])
+    monkeypatch.delenv("TELEGRAM_DOWNLOAD_SUBDIR", raising=False)
+
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="photo.jpg",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == downloads_root / "photo.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_default_uses_downloads_subdir_on_other_roots(
+    tmp_path, monkeypatch
+):
+    other_root = (tmp_path / "workspace").resolve()
+    other_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [other_root])
+    monkeypatch.delenv("TELEGRAM_DOWNLOAD_SUBDIR", raising=False)
+
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="photo.jpg",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == other_root / "downloads" / "photo.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_writable_file_path_custom_and_empty_download_subdir(tmp_path, monkeypatch):
+    other_root = (tmp_path / "workspace").resolve()
+    other_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [other_root])
+
+    monkeypatch.setenv("TELEGRAM_DOWNLOAD_SUBDIR", "custom_inbox")
+    out_path, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="doc.pdf",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path == other_root / "custom_inbox" / "doc.pdf"
+
+    monkeypatch.setenv("TELEGRAM_DOWNLOAD_SUBDIR", "")
+    out_path_empty, error = await runtime._resolve_writable_file_path(
+        raw_path=None,
+        default_filename="doc.pdf",
+        ctx=None,
+        tool_name="download_media",
+    )
+    assert error is None
+    assert out_path_empty == other_root / "doc.pdf"
+
+
 def test_roots_unsupported_detection():
     assert runtime._is_roots_unsupported_error(NotImplementedError()) is True
     assert runtime._is_roots_unsupported_error(AttributeError("missing list_roots")) is True
@@ -1005,3 +1572,302 @@ async def test_list_roots_unexpected_error_denies_without_opt_in(tmp_path, monke
     )
     assert status == runtime.ROOTS_STATUS_ERROR
     assert roots == []
+
+
+class _HangingRootsSession:
+    """Client that accepts roots/list but never answers it."""
+
+    async def list_roots(self):
+        await asyncio.sleep(3600)
+
+
+def _ctx_with_hanging_list_roots():
+    return SimpleNamespace(session=_HangingRootsSession())
+
+
+def test_roots_request_timeout_parsing(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", raising=False)
+    assert runtime._roots_request_timeout() == runtime.ROOTS_REQUEST_TIMEOUT_DEFAULT
+    assert runtime._roots_request_timeout("2.5") == 2.5
+    assert runtime._roots_request_timeout("0") is None
+    assert runtime._roots_request_timeout("-1") is None
+    assert runtime._roots_request_timeout("nonsense") == runtime.ROOTS_REQUEST_TIMEOUT_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_list_roots_timeout_falls_back_when_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.setenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", "1")
+    monkeypatch.setenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", "0.05")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_hanging_list_roots()
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_FALLBACK
+    assert roots == [root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_list_roots_timeout_denies_without_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+    monkeypatch.setenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", "0.05")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_hanging_list_roots()
+    )
+    assert status == runtime.ROOTS_STATUS_TIMEOUT
+    assert roots == []
+
+    _roots, error = await runtime._ensure_allowed_roots(
+        _ctx_with_hanging_list_roots(), "download_media"
+    )
+    assert error is not None
+    assert "roots/list" in error
+    assert "TELEGRAM_SERVER_ROOTS_ONLY" in error
+
+
+class _RootsSessionThatMustNotBeCalled:
+    """Client that would hang on roots/list; the server must not ask it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def list_roots(self):
+        self.calls += 1
+        await asyncio.sleep(3600)
+
+
+def test_server_roots_only_enabled_parsing(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+    assert runtime._server_roots_only_enabled() is False
+    assert runtime._server_roots_only_enabled("1") is True
+    assert runtime._server_roots_only_enabled("true") is True
+    assert runtime._server_roots_only_enabled("off") is False
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "yes")
+    assert runtime._server_roots_only_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_skips_client_roots_request(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+    monkeypatch.delenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", raising=False)
+    session = _RootsSessionThatMustNotBeCalled()
+    ctx = SimpleNamespace(session=session)
+
+    roots, status = await asyncio.wait_for(
+        runtime._get_effective_allowed_roots_with_status(ctx), timeout=1
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_ONLY
+    assert roots == [root.resolve()]
+
+    resolved, error = await asyncio.wait_for(
+        runtime._ensure_allowed_roots(ctx, "download_media"), timeout=1
+    )
+    assert error is None
+    assert resolved == [root.resolve()]
+    assert session.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_ignores_client_roots_when_server_roots_set(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    client_root = tmp_path / "client"
+    server_root.mkdir()
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [server_root.resolve()])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_ONLY
+    assert roots == [server_root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_keeps_client_roots_without_server_roots(tmp_path, monkeypatch):
+    client_root = tmp_path / "client"
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == [client_root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_client_roots_still_replace_server_roots_by_default(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    client_root = tmp_path / "client"
+    server_root.mkdir()
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [server_root.resolve()])
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == [client_root.resolve()]
+
+
+def test_get_file_extension_overrides_rejects_duplicate_tool_name():
+    """A repeated tool name must abort, not silently last-win.
+
+    ``send_file:.pdf;send_file:.exe`` used to keep only ``.exe``, so an
+    operator who meant to allow both got a config that looked applied and
+    was not.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:.pdf;send_file:.exe")
+
+    message = str(excinfo.value)
+    assert "send_file" in message
+    assert "more than once" in message
+
+
+@pytest.mark.asyncio
+async def test_send_file_override_bites_on_the_real_resolution_path(tmp_path, monkeypatch):
+    """The override must bite where send_file actually resolves its argument.
+
+    ``send_file`` and ``upload_file`` go through
+    ``_resolve_readable_file_path``, which is what calls
+    ``_ensure_extension_allowed``. Asserting on the checker alone would not
+    prove the feature does anything for the two tools it was added for, so
+    this drives the real resolver with the allowlist the real applier built.
+    """
+    root = (tmp_path / "root").resolve()
+    root.mkdir()
+    blocked = root / "payload.exe"
+    blocked.write_text("x", encoding="utf-8")
+    allowed = root / "report.pdf"
+    allowed.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
+    # Registers the current dict for restore, then let the real applier
+    # overwrite the module global the way startup does.
+    monkeypatch.setattr(runtime, "EXTENSION_ALLOWLISTS", dict(runtime.EXTENSION_ALLOWLISTS))
+    runtime._apply_file_extension_overrides(value="send_file:.pdf")
+
+    resolved, error = await runtime._resolve_readable_file_path(
+        raw_path=str(blocked), ctx=None, tool_name="send_file"
+    )
+    assert resolved is None
+    assert error is not None and "not allowed for send_file" in error
+
+    resolved, error = await runtime._resolve_readable_file_path(
+        raw_path=str(allowed), ctx=None, tool_name="send_file"
+    )
+    assert error is None
+    assert resolved == allowed
+
+
+def test_file_handler_encoding_is_utf8():
+    """Ensure runtime file_handler specifies utf-8 encoding."""
+    assert runtime.file_handler.encoding.lower() in ("utf-8", "utf8")
+
+
+def test_file_handler_handles_non_ascii_and_emojis(tmp_path):
+    """Ensure logging emojis and non-ASCII characters does not raise UnicodeEncodeError."""
+    log_file = tmp_path / "test_unicode.log"
+    handler = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
+    test_logger = logging.getLogger("test_unicode_logger")
+    test_logger.setLevel(logging.INFO)
+    test_logger.addHandler(handler)
+    try:
+        msg = "Test log with non-ASCII and emojis: 🔥 🚀 café русский 简体中文"
+        test_logger.info(msg)
+        handler.flush()
+        content = log_file.read_text(encoding="utf-8")
+        assert msg in content
+    finally:
+        test_logger.removeHandler(handler)
+        handler.close()
+
+
+def test_runtime_logger_logs_unicode_without_error():
+    """Ensure runtime.logger can log unicode characters without raising UnicodeEncodeError."""
+    test_msg = "Runtime error test: 🔥 rocket 🚀"
+    runtime.logger.error(test_msg)
+
+
+def test_stderr_utf8_reconfigure():
+    """Verify sys.stderr encoding handles non-ASCII characters gracefully."""
+    test_text = "Testing stderr with unicode: 🔥 🚀 café\n"
+    sys.stderr.write(test_text)
+    sys.stderr.flush()
+
+
+def test_resolve_session_path_special_cases():
+    """Verify empty, absolute, and :memory: sessions return untouched."""
+    assert runtime._resolve_session_path("") == ""
+    assert runtime._resolve_session_path(None) is None
+    assert runtime._resolve_session_path(":memory:") == ":memory:"
+    abs_path = os.path.abspath("some/path/my_session.session")
+    assert runtime._resolve_session_path(abs_path) == abs_path
+
+
+def test_resolve_session_path_resolves_existing_in_project_root(tmp_path, monkeypatch):
+    """Verify relative session name resolves to project root when session file exists there."""
+    fake_root = tmp_path / "project"
+    fake_root.mkdir()
+    session_file = fake_root / "my_custom.session"
+    session_file.touch()
+
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+
+    # Even if current directory is somewhere else
+    sub_dir = tmp_path / "other_dir"
+    sub_dir.mkdir()
+    monkeypatch.chdir(sub_dir)
+
+    resolved = runtime._resolve_session_path("my_custom")
+    assert resolved == str(fake_root / "my_custom")
+
+
+def test_resolve_session_path_resolves_in_subdirectory(tmp_path, monkeypatch):
+    """Verify relative session name resolves to project root when invoked from a subdirectory."""
+    fake_root = tmp_path / "project"
+    sub_dir = fake_root / "sub" / "deep"
+    sub_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+    monkeypatch.chdir(sub_dir)
+
+    # Even if the file does not exist yet, running from a subdirectory
+    # resolves against project root
+    resolved = runtime._resolve_session_path("new_account")
+    assert resolved == str(fake_root / "new_account")
+
+
+def test_discover_accounts_resolves_session_name_against_project_root(tmp_path, monkeypatch):
+    """Verify _discover_accounts resolves TELEGRAM_SESSION_NAME against project root."""
+    fake_root = tmp_path / "project"
+    fake_root.mkdir()
+    (fake_root / "app_session.session").touch()
+
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_NAME", "app_session")
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    # Run from outside root
+    other_dir = tmp_path / "outside"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+
+    accounts = runtime._discover_accounts()
+    assert "default" in accounts
+    assert accounts["default"].args[0] == str(fake_root / "app_session")

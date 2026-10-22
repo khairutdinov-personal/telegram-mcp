@@ -1,6 +1,7 @@
 """Tests for rich message sending (Telegram Premium gated)."""
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -51,10 +52,24 @@ async def test_send_rich_with_premium_sends_rich_request():
     cl = _FakeClient(premium=True)
     result = json.loads(await messages._send_rich(cl, "peer", "| a |", "rich", reply_to=5))
 
-    assert result == {"sent": True, "rich": True}
+    assert result == {"sent": True, "rich": True, "message_id": None}
     (req,) = cl.requests
     assert isinstance(req.rich_message, runtime.types.InputRichMessageMarkdown)
     assert req.reply_to.reply_to_msg_id == 5
+
+
+@pytest.mark.asyncio
+async def test_send_rich_names_the_sent_id():
+    class _SentClient(_FakeClient):
+        async def __call__(self, request):
+            await super().__call__(request)
+            return messages.types.UpdateShortSentMessage(
+                id=77, pts=1, pts_count=1, date=datetime(2026, 10, 10, tzinfo=timezone.utc)
+            )
+
+    result = json.loads(await messages._send_rich(_SentClient(), "peer", "| a |", "rich"))
+
+    assert result == {"sent": True, "rich": True, "message_id": 77}
 
 
 @pytest.mark.asyncio
@@ -148,6 +163,19 @@ def _rich(*blocks):
     return types.RichMessage(blocks=list(blocks), photos=[], documents=[])
 
 
+def _cell(text):
+    return types.PageTableCell(
+        header=False,
+        align_center=False,
+        align_right=False,
+        valign_middle=False,
+        valign_bottom=False,
+        text=_plain(text),
+        colspan=None,
+        rowspan=None,
+    )
+
+
 def _post_like_agents_lab_224():
     """The shape a real block-format post arrives in: a heading carrying a
     custom emoji, an uncaptioned photo, then paragraphs."""
@@ -172,27 +200,101 @@ def _post_like_agents_lab_224():
     )
 
 
-# Low-level block-to-text rendering (rich_text_to_markdown, page_block_to_markdown,
-# ...) is this fork's own code, split into telegram_mcp/rich_messages.py, and is
-# covered by tests/test_rich_message_reading.py. What's left here is the
-# integration: message_to_dict and format_message_line must still fall back to
-# rich content when plain text is empty.
+def test_rich_text_flattens_every_nesting_shape():
+    node = types.TextConcat(
+        texts=[
+            _plain("plain "),
+            types.TextBold(text=_plain("bold ")),
+            types.TextUrl(text=_plain("link"), url="https://example.com", webpage_id=0),
+            types.TextCustomEmoji(document_id=1, alt="🧠"),
+            types.TextEmpty(),
+        ]
+    )
+
+    assert runtime.rich_text_to_str(node) == "plain bold link🧠"
+
+
+def test_rich_text_ignores_nodes_that_carry_no_text():
+    assert runtime.rich_text_to_str(types.TextEmpty()) == ""
+    assert runtime.rich_text_to_str(types.TextImage(document_id=1, w=10, h=10)) == ""
+    assert runtime.rich_text_to_str(None) == ""
+
+
+def test_rich_message_text_walks_blocks():
+    text = runtime.rich_message_text(_msg(rich_message=_post_like_agents_lab_224()))
+
+    # One paragraph per block; the empty photo caption contributes nothing.
+    assert text == "Личная CRM 🧠\n\nПервый абзац.\n\nВторой абзац."
+
+
+def test_rich_message_text_reaches_captions_lists_tables_and_details():
+    rich = _rich(
+        types.PageBlockVideo(
+            video_id=1,
+            caption=types.PageCaption(text=_plain("под видео"), credit=types.TextEmpty()),
+            autoplay=False,
+            loop=False,
+            spoiler=False,
+        ),
+        types.PageBlockList(
+            items=[
+                types.PageListItemText(text=_plain("первый"), checkbox=None, checked=None),
+                types.PageListItemBlocks(
+                    blocks=[types.PageBlockParagraph(text=_plain("второй"))],
+                    checkbox=None,
+                    checked=None,
+                ),
+            ]
+        ),
+        types.PageBlockTable(
+            title=types.TextEmpty(),
+            rows=[types.PageTableRow(cells=[_cell("A"), _cell("B")])],
+            bordered=False,
+            striped=False,
+        ),
+        types.PageBlockDetails(
+            blocks=[types.PageBlockParagraph(text=_plain("скрытое"))],
+            title=_plain("подробнее"),
+            open=False,
+        ),
+    )
+
+    assert runtime.rich_message_text(_msg(rich_message=rich)) == (
+        "под видео\n\nпервый\nвторой\n\nA | B\n\nподробнее\nскрытое"
+    )
+
+
+def test_rich_message_text_skips_unknown_blocks_instead_of_failing():
+    rich = _rich(
+        SimpleNamespace(),  # a block type Telegram adds after this telethon build
+        types.PageBlockParagraph(text=_plain("уцелевший абзац")),
+    )
+
+    assert runtime.rich_message_text(_msg(rich_message=rich)) == "уцелевший абзац"
+
+
+def test_rich_message_text_is_empty_without_a_rich_message():
+    assert runtime.rich_message_text(_msg()) == ""
+    assert runtime.rich_message_text(SimpleNamespace()) == ""
 
 
 def test_message_to_dict_falls_back_to_rich_message():
     d = messages.message_to_dict(_msg(rich_message=_post_like_agents_lab_224()))
 
-    assert "Личная CRM" in d["text"]
-    assert "rich_message" in d
+    # The fork renders blocks as Markdown (the heading keeps its marker), so the
+    # title is no longer the first characters; the custom-emoji alt must survive.
+    assert d["text"].startswith("# Личная CRM 🧠")
+    assert d["rich"] is True
+    assert d["custom_emojis"] == [{"emoji": "🧠", "id": "5927026418616636353"}]
 
 
 def test_format_message_line_falls_back_to_rich_message():
     line = messages.format_message_line(_msg(rich_message=_post_like_agents_lab_224()))
 
     assert "Message: [empty]" not in line
-    assert "Личная CRM" in line
-    assert "Первый абзац" in line
+    assert "Личная CRM 🧠\\n\\nПервый абзац." in line
     assert "rich" in line
+    assert 'custom_emojis: [{"emoji": "🧠", "id": "5927026418616636353"}]' in line
 
 
 def test_plain_message_text_still_wins_over_rich_message():
