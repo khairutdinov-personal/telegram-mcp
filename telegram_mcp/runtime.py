@@ -577,7 +577,14 @@ _PROXY_TYPES_ALL = client_factory.PROXY_TYPES_ALL
 _get_proxy_env = client_factory.get_proxy_env
 _parse_bool_env = client_factory.parse_bool_env
 _build_proxy_for_label = client_factory.build_proxy_for_label
-_get_flood_sleep_threshold = client_factory.get_flood_sleep_threshold
+
+# Account discovery below runs at import time, before the module's main logger setup.
+logger = logging.getLogger("telegram_mcp")
+
+
+def _get_flood_sleep_threshold() -> int:
+    """Read TELEGRAM_FLOOD_SLEEP_THRESHOLD from environment (default: 60)."""
+    return client_factory.get_flood_sleep_threshold(logger)
 
 
 def _resolve_session_path(session_name: str) -> str:
@@ -626,7 +633,13 @@ def _build_client(session: Any, label: str) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
     if isinstance(session, str):
         session = _resolve_session_path(session)
-    return client_factory.build_client(session, label)
+    return client_factory.build_client(
+        session,
+        label,
+        client_cls=TelegramClient,
+        credentials=(TELEGRAM_API_ID, TELEGRAM_API_HASH),
+        flood_sleep_threshold=_get_flood_sleep_threshold(),
+    )
 
 
 # --- Session pool ------------------------------------------------------------

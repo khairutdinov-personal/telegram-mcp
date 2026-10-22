@@ -48,17 +48,17 @@ def _parse_targets(chats) -> list:
 async def start_chat_export(
     chats,
     everything: bool = False,
-    months: int = None,
-    since: str = None,
-    until: str = None,
+    months: Optional[int] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
     formats: str = "jsonl",
     media: bool = False,
-    media_max_mb: float = None,
-    transcribe: str = None,
+    media_max_mb: Optional[float] = None,
+    transcribe: Optional[str] = None,
     include_raw: bool = True,
     resume: bool = False,
-    out: str = None,
-    account: str = None,
+    out: Optional[str] = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     Export whole chats to files on the server, as a background job.
@@ -165,7 +165,10 @@ async def start_chat_export(
             ensure_ascii=False,
         )
     except ExportError as error:
-        return _fail("invalid_request", str(error))
+        # ExportError text is written by our own validation (targets, dates,
+        # formats), never taken from Telegram, so it is safe to show the caller.
+        reason = str(error)
+        return _fail("invalid_request", reason)
     except Exception as error:  # noqa: BLE001 - tool boundary
         return log_and_format_error("start_chat_export", error, chats=chats)  # noqa: F405
 
@@ -173,7 +176,7 @@ async def start_chat_export(
 @mcp.tool(  # noqa: F405
     annotations=ToolAnnotations(title="Export Status", readOnlyHint=True)  # noqa: F405
 )
-async def export_status(job_id: str = None, limit: int = 10) -> str:
+async def export_status(job_id: Optional[str] = None, limit: int = 10) -> str:
     """
     Progress of a background chat export.
 

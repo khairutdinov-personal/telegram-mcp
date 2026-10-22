@@ -897,6 +897,8 @@ def _plain_entities(text: str, format_date, custom_emojis):
             overlap = f"{before_label} and {after_label} overlap in the message text."
             return None, overlap
     return [entity for entity, _ in spans], None
+
+
 async def _send_rich_draft(cl, entity, text: str, parse_mode: str, draft_id: Optional[int]):
     """Push one state of a streaming rich draft. Returns a JSON result string.
 
@@ -1063,7 +1065,7 @@ async def stream_rich_draft(
     text: str,
     parse_mode: str = "rich_md",
     draft_id: Optional[int] = None,
-    account: str = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     Show a live, still-being-written rich message in a chat without posting it.

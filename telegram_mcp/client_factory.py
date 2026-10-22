@@ -126,22 +126,35 @@ def build_proxy_for_label(label: str) -> tuple[Optional[Any], Optional[Any]]:
     return proxy, None
 
 
-def get_flood_sleep_threshold() -> int:
+def get_flood_sleep_threshold(log: Optional[logging.Logger] = None) -> int:
     """Read TELEGRAM_FLOOD_SLEEP_THRESHOLD from environment (default: 60)."""
+    log = log or logger
     raw = os.getenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "60").strip()
     try:
         val = int(raw)
         if val < 0:
-            logger.warning("Negative TELEGRAM_FLOOD_SLEEP_THRESHOLD clamped to 0 (fail-fast mode)")
+            log.warning("Negative TELEGRAM_FLOOD_SLEEP_THRESHOLD clamped to 0 (fail-fast mode)")
             return 0
         return val
     except ValueError:
-        logger.warning("Invalid TELEGRAM_FLOOD_SLEEP_THRESHOLD; falling back to default 60s")
+        log.warning("Invalid TELEGRAM_FLOOD_SLEEP_THRESHOLD; falling back to default 60s")
         return 60
 
 
-def build_client(session: Any, label: str) -> TelegramClient:
-    """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
+def build_client(
+    session: Any,
+    label: str,
+    *,
+    client_cls: Any = None,
+    credentials: Optional[tuple] = None,
+    flood_sleep_threshold: Optional[int] = None,
+) -> TelegramClient:
+    """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration.
+
+    The keyword arguments let a caller that owns its own module-level state (the MCP
+    runtime holds the credentials and the client class its tests patch) inject it;
+    left out, credentials and the flood threshold come from the environment.
+    """
     proxy, connection = build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
@@ -149,7 +162,9 @@ def build_client(session: Any, label: str) -> TelegramClient:
     if connection is not None:
         kwargs["connection"] = connection
     # Read flood sleep threshold dynamically so runtime env changes take effect
-    kwargs["flood_sleep_threshold"] = get_flood_sleep_threshold()
+    kwargs["flood_sleep_threshold"] = (
+        get_flood_sleep_threshold() if flood_sleep_threshold is None else flood_sleep_threshold
+    )
     kwargs.update(client_identity_kwargs())
-    api_id, api_hash = api_credentials()
-    return TelegramClient(session, api_id, api_hash, **kwargs)
+    api_id, api_hash = credentials if credentials is not None else api_credentials()
+    return (client_cls or TelegramClient)(session, api_id, api_hash, **kwargs)

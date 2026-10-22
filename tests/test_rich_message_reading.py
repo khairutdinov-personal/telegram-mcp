@@ -52,6 +52,13 @@ def test_rich_text_empty_and_unknown_degrade_quietly():
     assert rich_messages.rich_text_to_markdown(anchor) == "jump"
 
 
+def test_custom_emoji_keeps_its_alt_character():
+    node = types.TextConcat(
+        texts=[_plain("CRM "), types.TextCustomEmoji(alt="\U0001f9e0", document_id=1)]
+    )
+    assert rich_messages.rich_text_to_markdown(node) == "CRM \U0001f9e0"
+
+
 # --- blocks ------------------------------------------------------------------
 
 

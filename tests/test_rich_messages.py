@@ -281,7 +281,9 @@ def test_rich_message_text_is_empty_without_a_rich_message():
 def test_message_to_dict_falls_back_to_rich_message():
     d = messages.message_to_dict(_msg(rich_message=_post_like_agents_lab_224()))
 
-    assert d["text"].startswith("Личная CRM 🧠")
+    # The fork renders blocks as Markdown (the heading keeps its marker), so the
+    # title is no longer the first characters; the custom-emoji alt must survive.
+    assert d["text"].startswith("# Личная CRM 🧠")
     assert d["rich"] is True
     assert d["custom_emojis"] == [{"emoji": "🧠", "id": "5927026418616636353"}]
 

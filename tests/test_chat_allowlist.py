@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from typing import Optional, Union
 
 import pytest
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl import functions
+from telethon.tl.types import Channel, Chat, PeerUser, User
 
 import main
 from telegram_mcp import runtime
@@ -653,22 +654,34 @@ async def test_get_direct_chat_by_contact_hides_unallowed_contacts(monkeypatch):
     other_ivan = User(id=202, first_name="Ivan", last_name="Sidorov")
 
     class DirectChatClient:
+        peers_requested = None
+
         async def __call__(self, request):
+            if isinstance(request, functions.messages.GetPeerDialogsRequest):
+                self.peers_requested = [p.peer for p in request.peers]
+                return SimpleNamespace(
+                    dialogs=[
+                        SimpleNamespace(peer=PeerUser(101), unread_count=1),
+                        SimpleNamespace(peer=PeerUser(202), unread_count=5),
+                    ]
+                )
             return SimpleNamespace(users=[ivan, other_ivan])
 
+        async def get_input_entity(self, entity):
+            return entity.id
+
         async def get_dialogs(self, **kwargs):
-            return [
-                SimpleNamespace(entity=ivan, unread_count=1),
-                SimpleNamespace(entity=other_ivan, unread_count=5),
-            ]
+            raise AssertionError("a contact lookup must not fetch the whole dialog list")
 
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101")
-    monkeypatch.setattr(contacts, "get_client", lambda account=None: DirectChatClient())
+    client = DirectChatClient()
+    monkeypatch.setattr(contacts, "get_client", lambda account=None: client)
     monkeypatch.setattr(contacts, "ensure_connected", _connected)
 
     res = json.loads(await contacts.get_direct_chat_by_contact(contact_query="ivan", account=None))
 
     assert [r["chat_id"] for r in res["results"]] == [101]
+    assert client.peers_requested == [101]  # the unallowed contact is never even asked about
     assert "Sidorov" not in json.dumps(res)
 
 

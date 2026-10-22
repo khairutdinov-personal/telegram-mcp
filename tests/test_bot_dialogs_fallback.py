@@ -25,6 +25,9 @@ class FakeBotClient:
         self.get_dialogs_called = True
         raise BotMethodInvalidError(request=None)
 
+    async def get_input_entity(self, entity):
+        return entity
+
 
 def _async_return(val):
     async def _fn(*args, **kwargs):
@@ -106,7 +109,8 @@ async def test_get_direct_chat_by_contact_bot_fallback(monkeypatch):
 
     result = await contacts.get_direct_chat_by_contact(contact_query="Test", account=None)
 
-    assert client.get_dialogs_called is True
+    # The bounded lookup asks for the matching peers only, never the whole dialog list.
+    assert client.get_dialogs_called is False
     assert "Found contacts: Test User, but no direct chats were found" in result
     assert "GEN-ERR" not in result
 
