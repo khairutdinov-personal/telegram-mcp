@@ -141,6 +141,36 @@ def get_flood_sleep_threshold(log: Optional[logging.Logger] = None) -> int:
         return 60
 
 
+def _int_env(name: str, log: logging.Logger) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Invalid %s; keeping the Telethon default", name)
+        return None
+
+
+def get_reconnect_kwargs(log: Optional[logging.Logger] = None) -> dict[str, int]:
+    """Telethon reconnect settings from TELEGRAM_CONNECTION_RETRIES / TELEGRAM_RETRY_DELAY.
+
+    Telethon gives up for good after 5 failed reconnects (``connection_retries``), which
+    leaves the update loop dead until the process restarts. A negative value retries
+    forever, so the client comes back by itself when the network does. Unset keeps the
+    Telethon defaults.
+    """
+    log = log or logger
+    kwargs: dict[str, int] = {}
+    retries = _int_env("TELEGRAM_CONNECTION_RETRIES", log)
+    if retries is not None:
+        kwargs["connection_retries"] = retries
+    delay = _int_env("TELEGRAM_RETRY_DELAY", log)
+    if delay is not None and delay >= 0:
+        kwargs["retry_delay"] = delay
+    return kwargs
+
+
 def build_client(
     session: Any,
     label: str,
@@ -165,6 +195,7 @@ def build_client(
     kwargs["flood_sleep_threshold"] = (
         get_flood_sleep_threshold() if flood_sleep_threshold is None else flood_sleep_threshold
     )
+    kwargs.update(get_reconnect_kwargs())
     kwargs.update(client_identity_kwargs())
     api_id, api_hash = credentials if credentials is not None else api_credentials()
     return (client_cls or TelegramClient)(session, api_id, api_hash, **kwargs)
