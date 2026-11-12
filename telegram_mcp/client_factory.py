@@ -14,6 +14,7 @@ import os
 from typing import Any, Optional
 
 from telethon import TelegramClient
+from telethon.network.mtprotosender import MTProtoSender
 
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.errors import ValidationError
@@ -150,6 +151,26 @@ def _int_env(name: str, log: logging.Logger) -> Optional[int]:
     except ValueError:
         log.warning("Invalid %s; keeping the Telethon default", name)
         return None
+
+
+_original_reconnect = MTProtoSender._reconnect
+
+
+async def _reconnect_with_fresh_ping(self, last_error):
+    """Telethon's ``_reconnect`` with the keep-alive ping state cleared first.
+
+    The update loop pings every minute and reconnects when the previous pong has not
+    arrived (``_keepalive_ping``). ``_reconnect`` resets the MTProto session but keeps
+    ``_ping``, so once a single pong is lost the sender never sends a new ping and
+    reconnects every minute for good (a hosted instance did this for three days from
+    09.11.2026). Clearing it lets the next tick send a fresh ping on the new connection.
+    """
+    self._ping = None
+    return await _original_reconnect(self, last_error)
+
+
+if getattr(MTProtoSender._reconnect, "__name__", "") != _reconnect_with_fresh_ping.__name__:
+    MTProtoSender._reconnect = _reconnect_with_fresh_ping
 
 
 def get_reconnect_kwargs(log: Optional[logging.Logger] = None) -> dict[str, int]:
