@@ -555,6 +555,12 @@ will use the server: a single long-lived process holds one Telegram
 connection, instead of every client spawning its own Telethon session —
 Telegram throttles and may flag accounts that open many parallel sessions.
 
+Scheduling can require a minimum lead time: `TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS`
+(default `0`, no minimum). When set, every scheduling path (`send_scheduled_message`,
+and `send_file` / `send_album` with `schedule_date`) refuses a `schedule_date` closer
+than that many seconds and names the limit in the error. A non-integer or negative
+value refuses scheduling instead of switching the guard off.
+
 Every tool call also has a server-side ceiling of 55 seconds, configured with
 `TELEGRAM_TOOL_TIMEOUT_SECONDS`. A timed-out Telegram request returns an explicit
 MCP error instead of leaving the client waiting indefinitely. The error says

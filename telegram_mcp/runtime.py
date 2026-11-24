@@ -129,12 +129,35 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
     return None
 
 
+def _min_schedule_lead_seconds() -> tuple[int, Optional[str]]:
+    """Return (seconds, None) from TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS, or (0, error).
+
+    Unset or empty means 0 (no minimum). A malformed or negative value is an error
+    instead of 0, so a typo cannot silently switch the guard off.
+    """
+    raw = os.getenv("TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS", "").strip()
+    if not raw:
+        return 0, None
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = -1
+    if seconds < 0:
+        return 0, (
+            "TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS must be a non-negative integer "
+            f"(got {raw!r}); scheduling is refused until it is fixed."
+        )
+    return seconds, None
+
+
 def parse_schedule_date(
     schedule_date: Union[str, int],
 ) -> tuple[Optional[datetime], Optional[str]]:
     """Return (datetime, None) for a usable schedule_date, or (None, error message).
 
     Accepts an ISO-8601 string or a Unix timestamp; naive datetimes are UTC.
+    TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS (default 0) sets a minimum lead time; every
+    schedule path (messages and media) goes through this function.
     """
     try:
         if isinstance(schedule_date, int):
@@ -152,6 +175,14 @@ def parse_schedule_date(
     if dt <= now:
         return None, (
             f"schedule_date must be in the future (got {dt.isoformat()}, now {now.isoformat()})."
+        )
+    min_lead, lead_error = _min_schedule_lead_seconds()
+    if lead_error:
+        return None, lead_error
+    if min_lead and dt < now + timedelta(seconds=min_lead):
+        return None, (
+            f"schedule_date must be at least {min_lead} seconds ahead "
+            f"(TELEGRAM_MIN_SCHEDULE_LEAD_SECONDS; got {dt.isoformat()}, now {now.isoformat()})."
         )
     return dt, None
 
